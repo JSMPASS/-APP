@@ -126,6 +126,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         self._search_results = []
         self._search_idx = 0
         self._last_search = ""
+        self._center_after = None
         self._detail_questions = []
         self._detail_open = False
         self._detail_anim_id = 0
@@ -1154,19 +1155,41 @@ class QuestionTypeMindmapWindow(tk.Frame):
             self.summary.configure(text="未找到匹配节点")
             return
         node_id = self._search_results[self._search_idx]
+        self._cancel_pending_center()
         self._expand_ancestors(node_id)
         self._select_node(node_id)
-        rect = self._node_rect.get(node_id)
-        if rect:
-            bbox = self.canvas.bbox(rect)
-            if bbox:
-                cx = (bbox[0] + bbox[2]) / 2
-                cy = (bbox[1] + bbox[3]) / 2
-                self._off_x = self.canvas.winfo_width() / 2 - cx
-                self._off_y = self.canvas.winfo_height() / 2 - cy
-                self._draw()
+        self._center_on_node(node_id)
+        # 详情抽屉从 0 展开到 300px，画布宽度变化后需再补一次，保证节点真正居中
+        self._center_after = self.after(200, lambda: self._center_on_node(node_id))
         self.summary.configure(text="{} / {}：{}".format(
             self._search_idx + 1, len(self._search_results), self._nodes[node_id]["name"]))
+
+    def _center_on_node(self, node_id):
+        """把节点中心移到当前画布可视区域正中心。"""
+        self._cancel_pending_center()
+        try:
+            rect = self._node_rect.get(node_id)
+            if not rect:
+                return
+            bbox = self.canvas.bbox(rect)
+            if not bbox:
+                return
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            self._off_x = self.canvas.winfo_width() / 2 - cx
+            self._off_y = self.canvas.winfo_height() / 2 - cy
+            self._draw()
+        except tk.TclError:
+            pass
+
+    def _cancel_pending_center(self):
+        if self._center_after is None:
+            return
+        try:
+            self.after_cancel(self._center_after)
+        except tk.TclError:
+            pass
+        self._center_after = None
 
     def _expand_ancestors(self, node_id):
         node = self._nodes.get(node_id)
