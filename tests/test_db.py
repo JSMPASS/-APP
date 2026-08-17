@@ -211,9 +211,14 @@ class TestDatabase(unittest.TestCase):
         pid = self.db.create_plan("2026-08-12")
         iid = self.db.add_plan_item(pid, cid)
         self.db.add_image(iid, rel)
+        qid = self.db.add_question(topic_id=cid, question_text="保留到未分类")
         self.db.delete_topic_cascade(tid)
         self.assertIsNone(self.db.get_plan_item(iid))
         self.assertFalse(Path(self.db.abs_path(rel)).exists())
+        q = self.db.get_question(qid)
+        self.assertIsNotNone(q)
+        self.assertIsNone(q["topic_id"])
+        self.assertEqual(q["question_text"], "保留到未分类")
         self.assertEqual(len(self.db.list_topics(include_disabled=True)), 26)
 
     def test_settings(self):

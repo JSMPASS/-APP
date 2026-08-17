@@ -721,6 +721,10 @@ class Database:
         self.conn.execute(
             "UPDATE question_types SET topic_id=NULL WHERE topic_id IN ({})".format(placeholders), ids
         )
+        # 题目保留到“未分类”，避免删除科目时因外键失败，也避免误删用户题库
+        self.conn.execute(
+            "UPDATE questions SET topic_id=NULL WHERE topic_id IN ({})".format(placeholders), ids
+        )
         for mr in self.conn.execute(
             "SELECT id FROM question_maps WHERE topic_id IN ({})".format(placeholders), ids
         ).fetchall():
