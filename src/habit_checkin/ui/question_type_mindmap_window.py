@@ -172,7 +172,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
                                        values=list(_LAYOUT_LABELS.values()))
         self.layout_box.pack(side="left", padx=(0, 8))
         self.layout_box.bind("<<ComboboxSelected>>", lambda e: self._set_layout())
-        ttk.Button(row2, text="导入预置", command=self._import_preset).pack(side="left", padx=4)
+        ttk.Button(row2, text="导入节点", command=self._import_preset).pack(side="left", padx=4)
         tk.Label(row2, text="搜索：", bg=P["bg"]).pack(side="left", padx=(12, 0))
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(row2, textvariable=self.search_var, width=12)
@@ -1052,16 +1052,16 @@ class QuestionTypeMindmapWindow(tk.Frame):
             self.summary.configure(text="已保存：节点位置、宽度与视图状态已写入数据库")
 
     def _import_preset(self):
-        """把科目管理的知识点树导入当前科目的思维导图（幂等）。"""
+        """把科目管理的具体分类节点树导入当前科目的思维导图（幂等）。"""
         m = self._current_map()
         if not m:
             return
         n = self.db.import_preset_question_types(m["id"])
         self._load_current_map()
         if n:
-            messagebox.showinfo("导入预置", "已导入 {} 个预置知识点节点。".format(n), parent=self)
+            messagebox.showinfo("导入节点", "已导入 {} 个分类节点。".format(n), parent=self)
         else:
-            messagebox.showinfo("导入预置", "当前科目没有可导入的预置内容，或内容已存在。", parent=self)
+            messagebox.showinfo("导入节点", "当前科目没有可导入的分类节点，或内容已存在。", parent=self)
 
     def _select_node(self, node_id):
         self._selected_id = node_id

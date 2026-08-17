@@ -118,18 +118,7 @@ class ReflectionWindow(tk.Frame):
         if root_id is None:
             self.sub_filter_box.configure(values=["全部细分"], state="readonly")
             return
-        topics = self.db.list_topics()
-        children = {}
-        for t in topics:
-            children.setdefault(t["parent_id"], []).append(t)
-
-        def walk(parent_id, prefix):
-            for t in children.get(parent_id, []):
-                rel = (prefix + " / " + t["name"]).strip(" / ")
-                self._sub_options.append((rel, t["id"]))
-                walk(t["id"], rel)
-
-        walk(root_id, "")
+        self._sub_options = self.db.category_subtopic_paths(root_id)
         self.sub_filter_box.configure(
             values=["全部细分"] + [p for p, _ in self._sub_options],
             state="readonly",

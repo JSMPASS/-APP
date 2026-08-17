@@ -452,7 +452,7 @@ class Database:
         """首次初始化时把预置科目的知识点树导入其思维导图（仅一次）。
 
         仅在科目根节点下还没有任何子节点时导入，避免覆盖用户手建结构；
-        完成后写标记，此后不自动重复（手动「导入预置」按钮随时可重导）。
+        完成后写标记，此后不自动重复（手动「导入节点」按钮随时可重导）。
         """
         if self.get_setting("mindmap_preset_imported"):
             return
@@ -663,6 +663,25 @@ class Database:
                     ids.append(r["id"])
                     changed = True
         return ids
+
+    def category_subtopic_paths(self, root_id):
+        """返回 root_id 下所有「具体分类」节点的相对路径，具体做法及其子树不返回。"""
+        topics = self.list_topics()
+        children = {}
+        for t in topics:
+            children.setdefault(t["parent_id"], []).append(t)
+        out = []
+
+        def walk(parent_id, prefix):
+            for t in children.get(parent_id, []):
+                if t["kind"] == "method":
+                    continue
+                rel = (prefix + " / " + t["name"]).strip(" / ")
+                out.append((rel, t["id"]))
+                walk(t["id"], rel)
+
+        walk(root_id, "")
+        return out
 
     def delete_topic_cascade(self, topic_id):
         ids = self.subtree_ids(topic_id)

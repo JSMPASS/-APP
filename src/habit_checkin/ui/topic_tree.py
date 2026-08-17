@@ -5,6 +5,8 @@ import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 
+from habit_checkin.ui.theme_menu import ThemeMenu
+
 
 class TopicTreeMixin:
     """依赖 self.db、self.tree，并提供 _refresh_tree() 的科目树编辑能力。"""
@@ -147,37 +149,43 @@ class TopicTreeMixin:
     # ---------- 右键增删改 ----------
     def _on_right_click(self, event):
         iid = self.tree.identify_row(event.y)
-        menu = tk.Menu(self, tearoff=0)
+        menu = ThemeMenu(self)
+        self._menu = menu
         if iid:
             topic_id = int(iid[1:])
             row = self.db.conn.execute(
-                "SELECT name, is_preset, disabled FROM topics WHERE id=?", (topic_id,)
+                "SELECT name, kind, is_preset, disabled FROM topics WHERE id=?", (topic_id,)
             ).fetchone()
             if not row:
                 return
             name = row["name"]
-            menu.add_command(label="新增子知识点", command=lambda: self._add_child_for(topic_id))
-            menu.add_separator()
+            next_kind = "具体做法" if row["kind"] == "category" else "具体分类"
+            items = [
+                ("＋ 新增子知识点", lambda: self._add_child_for(topic_id)),
+                ("---",),
+                ("切换为{}".format(next_kind), lambda: self._toggle_kind_for(topic_id)),
+                ("---",),
+            ]
             if row["is_preset"]:
-                menu.add_command(
-                    label="重命名（预置不可改）",
-                    command=lambda: messagebox.showinfo("重命名", "预置科目不支持重命名，可新增自定义科目代替。", parent=self),
-                )
-                menu.add_command(
-                    label="删除（预置不可删）",
-                    command=lambda: messagebox.showinfo("删除", "预置科目不支持删除，可改用「停用/启用」隐藏。", parent=self),
-                )
+                items.append((
+                    "✎ 重命名（预置不可改）",
+                    lambda: messagebox.showinfo("重命名", "预置科目不支持重命名，可新增自定义科目代替。", parent=self),
+                ))
+                items.append((
+                    "✕ 删除（预置不可删）",
+                    lambda: messagebox.showinfo("删除", "预置科目不支持删除，可改用「停用/启用」隐藏。", parent=self),
+                    True,
+                ))
             else:
-                menu.add_command(label="重命名「{}」".format(name), command=lambda: self._rename_for(topic_id))
-                menu.add_command(label="删除「{}」".format(name), command=lambda: self._delete_for(topic_id))
-            menu.add_command(
-                label=("停用「{}」" if not row["disabled"] else "启用「{}」").format(name),
-                command=lambda: self._toggle_disabled_for(topic_id),
-            )
+                items.append(("✎ 重命名「{}」".format(name), lambda: self._rename_for(topic_id)))
+                items.append(("✕ 删除「{}」".format(name), lambda: self._delete_for(topic_id), True))
+            items.append((
+                ("停用「{}」" if not row["disabled"] else "启用「{}」").format(name),
+                lambda: self._toggle_disabled_for(topic_id),
+            ))
         else:
-            menu.add_command(label="新增科目", command=self._add_root)
-        menu.tk_popup(event.x_root, event.y_root)
-        menu.grab_release()
+            items = [("＋ 新增科目", self._add_root)]
+        menu.show(event.x_root, event.y_root, items)
 
     def _add_root(self):
         name = simpledialog.askstring("新增科目", "科目名称：", parent=self)
@@ -225,6 +233,27 @@ class TopicTreeMixin:
     def _toggle_disabled_for(self, topic_id):
         row = self.db.conn.execute("SELECT disabled FROM topics WHERE id=?", (topic_id,)).fetchone()
         self.db.set_topic_disabled(topic_id, not row["disabled"])
+        self._refresh_tree()
+        self._after_topic_changed(topic_id)
+
+    def _toggle_kind_for(self, topic_id):
+        row = self.db.conn.execute("SELECT name, kind FROM topics WHERE id=?", (topic_id,)).fetchone()
+        if not row:
+            return
+        new_kind = "method" if row["kind"] == "category" else "category"
+        label = "具体做法" if new_kind == "method" else "具体分类"
+        if not messagebox.askyesno(
+            "切换类型",
+            "确定将「{}」切换为「{}」吗？\n"
+            "具体分类会进入思维导图和细分查询；\n"
+            "具体做法只用于生成计划，不入思维导图。".format(row["name"], label),
+            parent=self,
+        ):
+            return
+        try:
+            self.db.set_topic_kind(topic_id, new_kind)
+        except ValueError as exc:
+            messagebox.showwarning("切换失败", str(exc), parent=self)
         self._refresh_tree()
         self._after_topic_changed(topic_id)
 

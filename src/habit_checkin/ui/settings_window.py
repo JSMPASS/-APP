@@ -69,7 +69,7 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
         self.tree.heading("type", text="类型")
         self.tree.heading("state", text="状态")
         self.tree.column("#0", width=300, anchor="w")
-        self.tree.column("type", width=70, anchor="center", stretch=False)
+        self.tree.column("type", width=120, anchor="center", stretch=False)
         self.tree.column("state", width=70, anchor="center", stretch=False)
         vsb = ttk.Scrollbar(tab, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -89,7 +89,15 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
         hint.pack(side="right", fill="y")
         ttk.Label(
             hint,
-            text="右键科目标题可增删改；\n右键空白处可新增科目。\n长按拖动可调整顺序或层级\n（拖到分类上成为其子项）。\n预置科目只能停用；\n自定义科目可重命名、删除。\n删除会连带清理相关记录与图片。",
+            text="右键科目/知识点可增删改、切换类型；\n"
+                 "右键空白处可新增科目。\n"
+                 "长按拖动可调整顺序或层级\n"
+                 "（拖到分类上成为其子项）。\n"
+                 "具体分类会进入思维导图和细分查询；\n"
+                 "具体做法仅用于生成计划，不入导图。\n"
+                 "预置科目只能停用；\n"
+                 "自定义科目可重命名、删除。\n"
+                 "删除会连带清理相关记录与图片。",
             style="Hint.TLabel",
             justify="left",
         ).pack(fill="x")
@@ -105,7 +113,9 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
         def add(parent_iid, t):
             iid = "t{}".format(t["id"])
             state = "停用" if t["disabled"] else "启用"
-            typ = "预置" if t["is_preset"] else "自定义"
+            preset = "预置" if t["is_preset"] else "自定义"
+            kind = "具体做法" if t["kind"] == "method" else "具体分类"
+            typ = "{} · {}".format(preset, kind)
             self.tree.insert(parent_iid, "end", iid=iid, text=t["name"], values=(typ, state), open=True)
             for kid in children.get(t["id"], []):
                 add(iid, kid)

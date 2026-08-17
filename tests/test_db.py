@@ -81,6 +81,17 @@ class TestDatabase(unittest.TestCase):
         row = self.db.conn.execute("SELECT kind FROM topics WHERE id=?", (tid,)).fetchone()
         self.assertEqual(row["kind"], "method")
 
+    def test_category_subtopic_paths_skips_methods(self):
+        root = self.db.add_topic("分类科目")
+        cat = self.db.add_topic("单一指标", parent_id=root)
+        leaf = self.db.add_topic("具体细分", parent_id=cat)
+        method = self.db.add_topic("自由补弱", parent_id=root)
+        self.db.add_topic("子做法", parent_id=method)
+        self.assertEqual(
+            self.db.category_subtopic_paths(root),
+            [("单一指标", cat), ("单一指标 / 具体细分", leaf)],
+        )
+
     def test_plan_and_checkin(self):
         day = "2026-08-11"
         pid = self.db.create_plan(day, "今日计划")
