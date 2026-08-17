@@ -114,6 +114,22 @@ class TestDatabase(unittest.TestCase):
         rows = self.db.query_items("2026-08-01", "2026-08-31")
         self.assertEqual(len(rows), 1)
 
+    def test_update_checkin_can_override_checked_time(self):
+        pid = self.db.create_plan("2026-08-12")
+        iid = self.db.add_plan_item(pid, self._leaf("大作文")["id"])
+        self.db.update_checkin(iid, "ok", done=True, checked_at="2026-08-12 09:00:00")
+        self.assertEqual(self.db.get_plan_item(iid)["checked_at"], "2026-08-12 09:00:00")
+        self.db.update_checkin(
+            iid, "修改错误数据", done=True,
+            checked_at="2026-08-12 21:30:00", preserve_time=False,
+        )
+        self.assertEqual(self.db.get_plan_item(iid)["checked_at"], "2026-08-12 21:30:00")
+        self.assertEqual(self.db.get_plan_item(iid)["note"], "修改错误数据")
+        self.db.update_checkin(iid, "ok", done=True, checked_at="2026-08-12 22:00:00")
+        self.assertEqual(self.db.get_plan_item(iid)["checked_at"], "2026-08-12 21:30:00")
+        self.db.delete_plan_item(iid)
+        self.assertIsNone(self.db.get_plan_item(iid))
+
     def test_topic_paths_batch(self):
         root_id = self.db.add_topic("BatchRoot")
         child_id = self.db.add_topic("BatchChild", parent_id=root_id)

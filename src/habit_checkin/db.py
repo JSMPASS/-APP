@@ -896,12 +896,12 @@ class Database:
         self.conn.execute("UPDATE plan_items SET reminder_time=? WHERE id=?", (reminder_time, item_id))
         self.conn.commit()
 
-    def update_checkin(self, item_id, note, done=True, checked_at=None):
+    def update_checkin(self, item_id, note, done=True, checked_at=None, preserve_time=True):
         row = self.conn.execute("SELECT done, checked_at FROM plan_items WHERE id=?", (item_id,)).fetchone()
         if checked_at is None:
             checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 已完成的项保留首次打卡时间
-        if row and row["done"] and row["checked_at"]:
+        if preserve_time and row and row["done"] and row["checked_at"]:
             checked_at = row["checked_at"]
         self.conn.execute(
             "UPDATE plan_items SET note=?, done=?, checked_at=? WHERE id=?",
