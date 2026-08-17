@@ -225,6 +225,19 @@ class ReflectionFormDialog(tk.Toplevel):
         tk.Label(head, text="对错：{}".format(result_text(question)),
                  bg=P["card"], fg=res_color, font=("Microsoft YaHei UI", 13, "bold")
                  ).pack(anchor="w", pady=(2, 0))
+        topic_row = tk.Frame(head, bg=P["card"])
+        topic_row.pack(fill="x", pady=(6, 0))
+        tk.Label(topic_row, text="细分分类：", bg=P["card"], fg=P["text"],
+                 font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
+        self.topic_var = tk.StringVar()
+        self.topic_box = ttk.Combobox(topic_row, textvariable=self.topic_var,
+                                      state="readonly", width=42)
+        self.topic_box.pack(side="left", fill="x", expand=True)
+        self._category_paths = self.db.category_paths()
+        self.topic_box.configure(values=[p for p, _ in self._category_paths])
+        cur_path = self.db.topic_path(question["topic_id"]) if question.get("topic_id") else ""
+        self.topic_var.set(cur_path if cur_path in [p for p, _ in self._category_paths]
+                           else "（请选择具体分类）")
         if question["question_text"]:
             tk.Label(head, text="题目：" + question["question_text"][:160],
                      bg=P["card"], fg=P["muted"], font=("Microsoft YaHei UI", 11),
@@ -259,5 +272,16 @@ class ReflectionFormDialog(tk.Toplevel):
         if not any(data.values()):
             messagebox.showwarning("保存复盘", "请至少填写一个维度的内容。", parent=self)
             return
-        self.db.update_question(self.question["id"], **data)
+        topic_id = next(
+            (tid for path, tid in self._category_paths if path == self.topic_var.get()),
+            None,
+        )
+        if topic_id is None:
+            messagebox.showwarning(
+                "请选择具体分类",
+                "请先选择题目所属的具体分类（如资料分析 → 单一指标），再保存复盘。",
+                parent=self,
+            )
+            return
+        self.db.update_question(self.question["id"], topic_id=topic_id, **data)
         self.destroy()

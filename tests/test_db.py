@@ -92,6 +92,16 @@ class TestDatabase(unittest.TestCase):
             [("单一指标", cat), ("单一指标 / 具体细分", leaf)],
         )
 
+    def test_category_paths_skips_method_roots(self):
+        cat_root = self.db.add_topic("行测分类")
+        child = self.db.add_topic("单一指标", parent_id=cat_root)
+        method_root = self.db.add_topic("自由补弱")
+        self.db.add_topic("子做法", parent_id=method_root)
+        paths = dict(self.db.category_paths())
+        self.assertEqual(paths["行测分类 / 单一指标"], child)
+        self.assertNotIn("自由补弱", paths)
+        self.assertNotIn("自由补弱 / 子做法", paths)
+
     def test_plan_and_checkin(self):
         day = "2026-08-11"
         pid = self.db.create_plan(day, "今日计划")

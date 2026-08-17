@@ -192,8 +192,10 @@ class QuestionFormDialog(tk.Toplevel):
 
     def _save_current(self):
         if self.question is None:
-            return
-        topic_id = self.topic_id_map.get(self.topic_var.get())
+            return True
+        ok, topic_id = self._checked_topic_id()
+        if not ok:
+            return False
         result = {"正确": "correct", "错误": "wrong"}.get(self.result_var.get())
         self.db.update_question(
             self.question["id"], topic_id=topic_id,
@@ -204,6 +206,7 @@ class QuestionFormDialog(tk.Toplevel):
         kept = [im["rel"] for im in self.images if im["rel"]]
         new_sources = [im["abs"] for im in self.images if im["rel"] is None]
         self.db.sync_question_images(self.question["id"], kept, new_sources)
+        return True
 
     def _switch_question(self, delta):
         if self.question is None or not self._qlist:
@@ -212,7 +215,8 @@ class QuestionFormDialog(tk.Toplevel):
         if new_index < 0 or new_index >= len(self._qlist):
             messagebox.showinfo("切换题目", "已经到头了。", parent=self)
             return
-        self._save_current()
+        if not self._save_current():
+            return
         self._index = new_index
         q = self.db.get_question(self._qlist[new_index]["id"])
         if q:
@@ -579,7 +583,9 @@ class QuestionFormDialog(tk.Toplevel):
             "识别到多道题", "识别到 {} 道图形推理题，是否按题拆分？".format(len(parts)), parent=self
         )
         if ok:
-            topic_id = self.topic_id_map.get(self.topic_var.get())
+            ok_topic, topic_id = self._checked_topic_id(require_category=self._source == "checkin")
+            if not ok_topic:
+                return
             img_sources = [im["abs"] if im["rel"] is None else self.db.abs_path(im["rel"]) for im in self.images]
             created = []
             for q in parts:
@@ -611,7 +617,9 @@ class QuestionFormDialog(tk.Toplevel):
         self._render_images()
 
     def _split_into_questions(self, questions):
-        topic_id = self.topic_id_map.get(self.topic_var.get())
+        ok_topic, topic_id = self._checked_topic_id(require_category=self._source == "checkin")
+        if not ok_topic:
+            return
         sources = [im["abs"] if im["rel"] is None else self.db.abs_path(im["rel"]) for im in self.images]
         created = []
         for q in questions:
@@ -626,9 +634,36 @@ class QuestionFormDialog(tk.Toplevel):
         self.saved_question = self.db.get_question(created[0])
         self.destroy()
 
+    def _checked_topic_id(self, require_category=False):
+        """校验题目分类并返回 (ok, topic_id)：具体做法节点不能作为题目分类。"""
+        topic_id = self.topic_id_map.get(self.topic_var.get())
+        if topic_id is None:
+            if require_category:
+                messagebox.showwarning(
+                    "请选择具体分类",
+                    "请先选择题目所属的具体分类（如资料分析 → 单一指标），再保存。",
+                    parent=self,
+                )
+                return False, None
+            return True, None
+        row = self.db.conn.execute(
+            "SELECT name, kind FROM topics WHERE id=?", (topic_id,)
+        ).fetchone()
+        if row and row["kind"] == "method":
+            messagebox.showwarning(
+                "请选择具体分类",
+                "「{}」是具体做法，不能作为题目分类。\n"
+                "请改选具体分类节点（如资料分析 → 单一指标）。".format(row["name"]),
+                parent=self,
+            )
+            return False, None
+        return True, topic_id
+
     # ---------- 保存 ----------
     def _save(self):
-        topic_id = self.topic_id_map.get(self.topic_var.get())
+        ok_topic, topic_id = self._checked_topic_id(require_category=self._source == "checkin")
+        if not ok_topic:
+            return
         result = {"正确": "correct", "错误": "wrong"}.get(self.result_var.get())
         reason = self.reason_var.get().strip()
         fields = {

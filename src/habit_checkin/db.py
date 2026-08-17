@@ -683,6 +683,26 @@ class Database:
         walk(root_id, "")
         return out
 
+    def category_paths(self):
+        """返回全部「具体分类」节点的完整路径（根 → 叶），具体做法及其子树不返回。"""
+        topics = self.list_topics()
+        children = {}
+        for t in topics:
+            children.setdefault(t["parent_id"], []).append(t)
+        out = []
+
+        def walk(t, prefix):
+            if t["kind"] == "method":
+                return
+            rel = (prefix + " / " + t["name"]).strip(" / ")
+            out.append((rel, t["id"]))
+            for kid in children.get(t["id"], []):
+                walk(kid, rel)
+
+        for r in children.get(None, []):
+            walk(r, "")
+        return out
+
     def delete_topic_cascade(self, topic_id):
         ids = self.subtree_ids(topic_id)
         placeholders = ",".join("?" * len(ids))
