@@ -8,7 +8,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from habit_checkin.services.study_plan import (
-    DEFAULT_START, day_number, get_plan_config, plan_week_of, remaining_days, stage_for,
+    DEFAULT_START, day_number, get_plan_config, plan_week_of, remaining_days,
+    save_plan_config, stage_for,
 )
 from habit_checkin.services import plan_docs
 from habit_checkin.ui.common import ScrollableFrame, setup_styles
@@ -143,7 +144,7 @@ class StudyProgressPage(tk.Frame):
         P = PALETTE
         tk.Label(self._container, text="{} 个阶段".format(len(stages)), bg=P["bg"], fg=P["text"],
                  font=("Microsoft YaHei UI", 20, "bold")).pack(anchor="w", pady=(0, 4))
-        for s in stages:
+        for idx, s in enumerate(stages):
             s_start = (start + timedelta(days=s["day_start"] - 1)).isoformat()
             s_end = (start + timedelta(days=s["day_end"] - 1)).isoformat()
             total = sum(v["total"] for d, v in daily.items() if s_start <= d <= s_end)
@@ -170,6 +171,7 @@ class StudyProgressPage(tk.Frame):
             tk.Label(box, text="申论：{}".format(s["shenlun"]),
                      bg=P["surface"], fg=P["muted"], font=("Microsoft YaHei UI", 13),
                      wraplength=1400, justify="left").pack(anchor="w")
+            self._bind_double_edit(box, lambda i=idx: self._edit_stage(i))
 
     # ---------- 13 周 ----------
     def _render_weeks(self, start, day, weeks, total_days):
@@ -194,6 +196,7 @@ class StudyProgressPage(tk.Frame):
             tk.Label(row, text=focus, bg=row["bg"], fg=P["text"],
                      font=("Microsoft YaHei UI", 13), anchor="w", wraplength=900, justify="left").pack(
                 side="left", fill="x", expand=True)
+            self._bind_double_edit(row, lambda w=wk: self._edit_week(w))
 
     # ---------- 检查点 ----------
     def _render_checkpoints(self, day, checkpoints):
@@ -218,6 +221,7 @@ class StudyProgressPage(tk.Frame):
                      font=("Microsoft YaHei UI", 13, "bold"), width=14, anchor="w").pack(side="left", padx=6)
             tk.Label(row, text=content, bg=row["bg"], fg=P["text"],
                      font=("Microsoft YaHei UI", 13), anchor="w").pack(side="left", fill="x", expand=True)
+            self._bind_double_edit(row, lambda d=cp_day: self._edit_checkpoint(d))
 
     # ---------- 热力图 ----------
     def _render_heatmap(self, parent=None):
@@ -259,8 +263,21 @@ class StudyProgressPage(tk.Frame):
             tk.Label(row, text=desc, bg=P["surface"], fg=P["text"],
                      font=("Microsoft YaHei UI", 13), anchor="w", justify="left",
                      wraplength=480).pack(side="left", fill="x", expand=True)
+            self._bind_double_edit(row, lambda t=tm: self._edit_routine(t))
 
     # ---------- 工具 ----------
+    def _bind_double_edit(self, widget, handler):
+        """给整块区域及子 Label 绑定双击编辑，便于点击任意子区域触发。"""
+        if isinstance(widget, (tk.Frame, tk.Label)):
+            widget.bind("<Double-Button-1>", lambda e: handler())
+            if isinstance(widget, tk.Label):
+                try:
+                    widget.configure(cursor="hand2")
+                except tk.TclError:
+                    pass
+        for child in widget.winfo_children():
+            self._bind_double_edit(child, handler)
+
     def _progress_bar(self, parent, caption, done, total):
         P = PALETTE
         row = tk.Frame(parent, bg=P["surface"])
@@ -274,6 +291,130 @@ class StudyProgressPage(tk.Frame):
                  font=("Microsoft YaHei UI", 13)).pack(side="left", padx=(8, 0))
 
     # ---------- 操作 ----------
+    def _edit_stage(self, index):
+        cfg = get_plan_config(self.db)
+        if index >= len(cfg["stages"]):
+            return
+        s = cfg["stages"][index]
+        values = self._ask_plan_item("编辑阶段", [
+            {"key": "name", "label": "阶段名称", "value": s["name"]},
+            {"key": "day_start", "label": "开始天数", "value": str(s["day_start"])},
+            {"key": "day_end", "label": "结束天数", "value": str(s["day_end"])},
+            {"key": "xingce", "label": "行测内容", "value": s.get("xingce", ""),
+             "multiline": True, "height": 3},
+            {"key": "shenlun", "label": "申论内容", "value": s.get("shenlun", ""),
+             "multiline": True, "height": 3},
+            {"key": "exit", "label": "退出标准", "value": s.get("exit", ""),
+             "multiline": True, "height": 3},
+        ])
+        if not values:
+            return
+        try:
+            day_start = int(values["day_start"])
+            day_end = int(values["day_end"])
+        except ValueError:
+            messagebox.showwarning("编辑阶段", "开始/结束天数必须是数字。", parent=self)
+            return
+        if day_start < 1 or day_end < day_start:
+            messagebox.showwarning("编辑阶段", "结束天数不能小于开始天数。", parent=self)
+            return
+        if day_end > cfg["total_days"]:
+            messagebox.showwarning("编辑阶段", "结束天数不能超过总天数 {}。".format(cfg["total_days"]), parent=self)
+            return
+        cfg["stages"][index] = {
+            "name": values["name"] or s["name"],
+            "day_start": day_start,
+            "day_end": day_end,
+            "xingce": values["xingce"],
+            "shenlun": values["shenlun"],
+            "exit": values["exit"],
+        }
+        self._save_plan_config(cfg)
+
+    def _edit_week(self, week_num):
+        cfg = get_plan_config(self.db)
+        focus = next((f for wk, f in cfg["weeks"] if wk == week_num), "")
+        values = self._ask_plan_item("编辑第 {} 周".format(week_num), [
+            {"key": "focus", "label": "本周重点", "value": focus,
+             "multiline": True, "height": 4},
+        ])
+        if not values:
+            return
+        cfg["weeks"] = [[wk, values["focus"] if wk == week_num else focus]
+                        for wk, focus in cfg["weeks"]]
+        self._save_plan_config(cfg)
+
+    def _edit_checkpoint(self, cp_day):
+        cfg = get_plan_config(self.db)
+        content = next((c for day, c in cfg["checkpoints"] if day == cp_day), "")
+        values = self._ask_plan_item("编辑检查点 · 第 {} 天".format(cp_day), [
+            {"key": "day", "label": "检查天数", "value": str(cp_day)},
+            {"key": "content", "label": "检查内容", "value": content,
+             "multiline": True, "height": 4},
+        ])
+        if not values:
+            return
+        try:
+            new_day = int(values["day"])
+        except ValueError:
+            messagebox.showwarning("编辑检查点", "检查天数必须是数字。", parent=self)
+            return
+        if new_day < 1 or new_day > cfg["total_days"]:
+            messagebox.showwarning("编辑检查点", "检查天数需在 1 ~ {} 之间。".format(cfg["total_days"]), parent=self)
+            return
+        cfg["checkpoints"] = [
+            [new_day if day == cp_day else day, values["content"] if day == cp_day else content]
+            for day, content in cfg["checkpoints"]
+        ]
+        self._save_plan_config(cfg)
+
+    def _edit_routine(self, tm):
+        cfg = get_plan_config(self.db)
+        desc = next((d for t, d in cfg["daily_routine"] if t == tm), "")
+        values = self._ask_plan_item("编辑作息 {}".format(tm), [
+            {"key": "time", "label": "时间", "value": tm},
+            {"key": "desc", "label": "内容", "value": desc, "multiline": True, "height": 4},
+        ])
+        if not values:
+            return
+        time_parts = values["time"].split(":")
+        if len(time_parts) != 2 or not all(p.isdigit() for p in time_parts):
+            messagebox.showwarning("编辑作息", "时间格式应为 HH:MM。", parent=self)
+            return
+        cfg["daily_routine"] = [
+            [values["time"] if t == tm else t, values["desc"] if t == tm else d]
+            for t, d in cfg["daily_routine"]
+        ]
+        self._save_plan_config(cfg)
+
+    def _ask_plan_item(self, title, fields):
+        from habit_checkin.ui.plan_item_edit_dialog import ask_plan_item
+        return ask_plan_item(self.master, title, fields)
+
+    def _save_plan_config(self, cfg):
+        save_plan_config(self.db, cfg)
+        source = plan_docs.markdown_source_path(self.db)
+        if not source:
+            rel = self.db.get_setting("plan_source_file", "")
+            if rel:
+                messagebox.showinfo(
+                    "已保存到 App",
+                    "当前计划来源不是 Markdown/文本或文件不存在，修改已保存到 App 内。",
+                    parent=self,
+                )
+            self.refresh()
+            return
+        try:
+            plan_docs.update_markdown_config_sections(source, cfg)
+            self.top_hint.configure(text="已同步：{}".format(Path(source).name))
+        except Exception as exc:
+            messagebox.showwarning(
+                "文档同步失败",
+                "修改已保存到 App，但无法回写文档：{}".format(exc),
+                parent=self,
+            )
+        self.refresh()
+
     def _open_plan_settings(self):
         from habit_checkin.ui.plan_settings_dialog import PlanSettingsDialog
         PlanSettingsDialog(self.master, self.db)

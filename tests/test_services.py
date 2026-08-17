@@ -238,5 +238,104 @@ class TestPlanDocImport(unittest.TestCase):
         self.assertEqual(self.db.get_setting("plan_source_file"), "start.md")
 
 
+class TestPlanDocMarkdownSync(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = Database(self.root / "app.db", self.root / "images", self.root)
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def test_update_sections_keeps_notes_and_daily_tasks(self):
+        md = self.root / "plan.md"
+        md.write_text(
+            "# 习惯打卡计划模板\n"
+            "- 开始日期：2026-08-01\n"
+            "\n"
+            "## 阶段安排\n"
+            "\n"
+            "- 基础奠基（第 1 - 30 天）：行测基础；退出标准：基础完成\n"
+            "> 自定义备注\n"
+            "\n"
+            "## 每周计划\n"
+            "\n"
+            "- 第 1 周：基础\n"
+            "- 第 2 周：强化\n"
+            "\n"
+            "## 检查点\n"
+            "\n"
+            "- 第 10 天：检查基础\n"
+            "- 第 20 天：检查强化\n"
+            "\n"
+            "## 每日作息模板\n"
+            "\n"
+            "- 09:00 晨读\n"
+            "- 23:00 睡觉\n"
+            "\n"
+            "## 每日任务\n"
+            "\n"
+            "### 2026-08-01\n"
+            "- 09:30 | 大作文 | 主 | 写一篇\n",
+            encoding="utf-8",
+        )
+        cfg = {
+            "total_days": 90,
+            "stages": [
+                {"name": "基础奠基", "day_start": 1, "day_end": 30,
+                 "xingce": "行测基础", "shenlun": "申论基础", "exit": "基础完成"},
+                {"name": "专项强化", "day_start": 31, "day_end": 60,
+                 "xingce": "限时专项", "shenlun": "大作文", "exit": "速度提升"},
+            ],
+            "weeks": [[1, "第一周修改"], [3, "第三周新增"]],
+            "checkpoints": [[10, "检查基础修改"], [45, "检查专项"]],
+            "daily_routine": [["09:00", "晨读修改"], ["21:30", "明日计划"]],
+        }
+        plan_docs.update_markdown_config_sections(str(md), cfg)
+        text = md.read_text(encoding="utf-8")
+        self.assertIn("- 基础奠基（第 1 - 30 天）：行测基础；申论：申论基础；退出标准：基础完成", text)
+        self.assertIn("- 专项强化（第 31 - 60 天）：限时专项；申论：大作文；退出标准：速度提升", text)
+        self.assertIn("> 自定义备注", text)
+        self.assertIn("- 第 1 周：第一周修改", text)
+        self.assertIn("- 第 3 周：第三周新增", text)
+        self.assertNotIn("- 第 2 周：强化", text)
+        self.assertIn("- 第 10 天：检查基础修改", text)
+        self.assertIn("- 第 45 天：检查专项", text)
+        self.assertNotIn("- 第 20 天：检查强化", text)
+        self.assertIn("- 09:00 晨读修改", text)
+        self.assertIn("- 21:30 明日计划", text)
+        self.assertNotIn("- 23:00 睡觉", text)
+        self.assertIn("### 2026-08-01", text)
+        self.assertIn("- 09:30 | 大作文 | 主 | 写一篇", text)
+
+    def test_missing_sections_are_inserted_before_daily_tasks(self):
+        md = self.root / "plan.md"
+        md.write_text(
+            "# 习惯打卡计划模板\n"
+            "- 开始日期：2026-08-01\n"
+            "\n"
+            "## 每日任务\n"
+            "\n"
+            "### 2026-08-01\n"
+            "- 09:00 | 判断 | 主 | 练习\n",
+            encoding="utf-8",
+        )
+        cfg = {
+            "total_days": 14,
+            "stages": [{"name": "基础", "day_start": 1, "day_end": 14,
+                        "xingce": "行测", "shenlun": "申论", "exit": "完成"}],
+            "weeks": [[1, "第一周"]],
+            "checkpoints": [[7, "中期检查"]],
+            "daily_routine": [["09:00", "晨读"]],
+        }
+        plan_docs.update_markdown_config_sections(str(md), cfg)
+        text = md.read_text(encoding="utf-8")
+        self.assertIn("## 阶段安排", text)
+        self.assertIn("## 每日作息模板", text)
+        self.assertLess(text.index("## 每日作息模板"), text.index("## 每日任务"))
+        self.assertIn("- 09:00 | 判断 | 主 | 练习", text)
+
+
 if __name__ == "__main__":
     unittest.main()

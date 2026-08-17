@@ -34,6 +34,16 @@ _DAY_RE = re.compile(r"^\s*#+\s*(\d{4}-\d{2}-\d{2})\s*$|^\s*(\d{4}-\d{2}-\d{2})\
 _TASK_RE = re.compile(
     r"^\s*(?:[-*]\s*)?(\d{2}:\d{2})\s*[|｜]\s*([^|｜]+?)\s*[|｜]\s*(主|辅|main|aux)?\s*[|｜]?\s*(.*)$"
 )
+_HEADING_RE = re.compile(r"^\s*(#{1,6})\s+(.+?)\s*$")
+_STAGE_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?P<name>.+?)（第\s*(?P<day_start>\d+)\s*[-—~]\s*"
+    r"(?P<day_end>\d+)\s*天）\s*[:：]?\s*(?P<rest>.*)$"
+)
+_WEEK_RE = re.compile(r"^\s*(?:[-*]\s*)?第\s*(?P<week>\d+)\s*周\s*[:：]\s*(?P<focus>.*)$")
+_CHECKPOINT_RE = re.compile(r"^\s*(?:[-*]\s*)?第\s*(?P<day>\d+)\s*天\s*[:：]\s*(?P<content>.*)$")
+_ROUTINE_RE = re.compile(r"^\s*(?:[-*]\s*)?(?P<time>\d{1,2}:\d{2})\s+(?P<desc>.*)$")
+
+_CONFIG_SECTIONS = ("阶段安排", "每周计划", "检查点", "每日作息模板")
 
 
 # ---------- 读取文档文本 ----------
@@ -77,12 +87,7 @@ def _template_lines(config=None):
         "",
     ]
     for s in cfg["stages"]:
-        lines.append(
-            "- {}（第 {} - {} 天）：{}；退出标准：{}".format(
-                s["name"], s["day_start"], s["day_end"],
-                s.get("xingce", ""), s.get("exit", ""),
-            )
-        )
+        lines.append(_markdown_stage_line(s))
     lines += ["", "## 每周计划", ""]
     for wk, focus in cfg["weeks"]:
         lines.append("- 第 {} 周：{}".format(wk, focus))
@@ -135,8 +140,7 @@ def export_docx_template(path, config=None):
     doc.add_paragraph("总天数：{}".format(cfg["total_days"]))
     doc.add_heading("阶段安排", level=1)
     for s in cfg["stages"]:
-        doc.add_paragraph("- {}（第 {} - {} 天）：{}；退出标准：{}".format(
-            s["name"], s["day_start"], s["day_end"], s.get("xingce", ""), s.get("exit", "")))
+        doc.add_paragraph(_markdown_stage_line(s))
     doc.add_heading("每周计划", level=1)
     for wk, focus in cfg["weeks"]:
         doc.add_paragraph("- 第 {} 周：{}".format(wk, focus))
@@ -201,8 +205,7 @@ def export_pdf_template(path, config=None):
         Paragraph("阶段安排", styles["h"]),
     ]
     for s in cfg["stages"]:
-        story.append(Paragraph("- {}（第 {} - {} 天）：{}；退出标准：{}".format(
-            s["name"], s["day_start"], s["day_end"], s.get("xingce", ""), s.get("exit", "")), styles["body"]))
+        story.append(Paragraph(_markdown_stage_line(s), styles["body"]))
     story.append(Paragraph("每周计划", styles["h"]))
     for wk, focus in cfg["weeks"]:
         story.append(Paragraph("- 第 {} 周：{}".format(wk, focus), styles["body"]))
@@ -247,6 +250,136 @@ def export_template(path, fmt, config=None):
     if fmt == "pdf":
         return export_pdf_template(path, config=config)
     raise ValueError("不支持的模板格式：{}".format(fmt))
+
+
+# ---------- 配置段落回写 ----------
+def _markdown_stage_line(s):
+    return "- {}（第 {} - {} 天）：{}；申论：{}；退出标准：{}".format(
+        s["name"], s["day_start"], s["day_end"],
+        s.get("xingce", ""), s.get("shenlun", ""), s.get("exit", ""),
+    )
+
+
+def _section_item_lines(heading, cfg):
+    if heading == "阶段安排":
+        return [_markdown_stage_line(s) for s in cfg["stages"]]
+    if heading == "每周计划":
+        return ["- 第 {} 周：{}".format(wk, focus) for wk, focus in cfg["weeks"]]
+    if heading == "检查点":
+        return ["- 第 {} 天：{}".format(cp_day, content) for cp_day, content in cfg["checkpoints"]]
+    if heading == "每日作息模板":
+        return ["- {} {}".format(tm, desc) for tm, desc in cfg["daily_routine"]]
+    return []
+
+
+def _heading_name(line):
+    m = _HEADING_RE.match(line)
+    return m.group(2).strip() if m else None
+
+
+def _item_key(heading, line):
+    if heading == "每周计划":
+        m = _WEEK_RE.match(line.strip())
+        return int(m.group("week")) if m else None
+    if heading == "检查点":
+        m = _CHECKPOINT_RE.match(line.strip())
+        return int(m.group("day")) if m else None
+    if heading == "每日作息模板":
+        m = _ROUTINE_RE.match(line.strip())
+        return m.group("time") if m else None
+    return None
+
+
+def _sync_section_items(body, heading, cfg):
+    """按结构化行回写配置，保留段落里的自定义备注与空行。"""
+    if heading == "阶段安排":
+        new_items = _section_item_lines(heading, cfg)
+        out = []
+        idx = 0
+        for line in body:
+            if _STAGE_RE.match(line.strip()):
+                if idx < len(new_items):
+                    out.append(new_items[idx])
+                    idx += 1
+                continue
+            out.append(line)
+        out.extend(new_items[idx:])
+        return out
+
+    keyed = []
+    if heading == "每周计划":
+        keyed = [(int(wk), "- 第 {} 周：{}".format(wk, focus)) for wk, focus in cfg["weeks"]]
+    elif heading == "检查点":
+        keyed = [(int(cp_day), "- 第 {} 天：{}".format(cp_day, content))
+                 for cp_day, content in cfg["checkpoints"]]
+    elif heading == "每日作息模板":
+        keyed = [(tm, "- {} {}".format(tm, desc)) for tm, desc in cfg["daily_routine"]]
+    wanted = {key: line for key, line in keyed}
+    seen = set()
+    out = []
+    for line in body:
+        key = _item_key(heading, line)
+        if key is not None:
+            if key in wanted and key not in seen:
+                out.append(wanted[key])
+                seen.add(key)
+            continue
+        out.append(line)
+    out.extend(line for key, line in keyed if key not in seen)
+    return out
+
+
+def update_markdown_config_sections(path, config):
+    """把计划配置回写到 Markdown/文本文件的四个配置段落。
+
+    「每日任务」段落及其中的日期、任务、备注保持不变；配置段落里的
+    自定义备注行也会保留，只替换/增删结构化条目。
+    """
+    cfg = normalize_plan_config(config)
+    p = Path(path)
+    text = p.read_text(encoding="utf-8", errors="replace")
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines()
+
+    for heading in _CONFIG_SECTIONS:
+        start = next((i for i, line in enumerate(lines) if _heading_name(line) == heading), None)
+        if start is None:
+            continue
+        j = start + 1
+        while j < len(lines) and _heading_name(lines[j]) is None:
+            j += 1
+        body = _sync_section_items(lines[start + 1:j], heading, cfg)
+        lines = lines[:start + 1] + body + lines[j:]
+
+    missing = [h for h in _CONFIG_SECTIONS
+               if not any(_heading_name(line) == h for line in lines)]
+    if missing:
+        block = []
+        for heading in missing:
+            block += ["## " + heading, ""] + _section_item_lines(heading, cfg) + [""]
+        daily_idx = next((i for i, line in enumerate(lines)
+                          if _heading_name(line) == "每日任务"), None)
+        if daily_idx is None:
+            lines += block
+        else:
+            lines = lines[:daily_idx] + block + lines[daily_idx:]
+
+    content = newline.join(lines)
+    if not content.endswith(newline):
+        content += newline
+    p.write_text(content, encoding="utf-8")
+    return str(p)
+
+
+def markdown_source_path(db):
+    """返回可回写的计划来源文件；不是 Markdown/文本或已不存在时返回 None。"""
+    rel = db.get_setting("plan_source_file", "") if hasattr(db, "get_setting") else ""
+    if not rel:
+        return None
+    path = Path(db.abs_path(rel))
+    if path.suffix.lower() not in (".md", ".txt", ".text"):
+        return None
+    return str(path) if path.is_file() else None
 
 
 # ---------- 导入同步 ----------
