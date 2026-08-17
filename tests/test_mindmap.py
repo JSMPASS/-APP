@@ -13,6 +13,9 @@ from habit_checkin.services.mindmap_export import export_mindmap_markdown
 from habit_checkin.ui.question_type_mindmap_window import (
     QuestionTypeMindmapWindow,
     _NODE_W,
+    _NODE_H,
+    _NODE_GAP,
+    estimate_node_width,
     bezier_curve,
     round_rect_points,
     screen_to_world,
@@ -158,32 +161,61 @@ class TestLayout(unittest.TestCase):
         self.assertEqual((x, y), (1234.0, -567.0))
 
     def test_columns_layout_kept(self):
-        """两翼对称布局保留：前一半左列、后一半右列。"""
-        _, pos = self._layout("columns")
-        kids = self.children[self.children[None][0]["id"]]
+        """两翼对称布局保留：前一半左列、后一半右列，间距按节点宽度计算。"""
+        w, pos = self._layout("columns")
+        root = self.children[None][0]
+        kids = self.children[root["id"]]
         half = (len(kids) + 1) // 2
+        root_w = w._node_width(root)
         for k in kids[:half]:
-            self.assertEqual(pos[k["id"]][0], -240.0)
+            self.assertAlmostEqual(
+                pos[k["id"]][0],
+                -(root_w + w._node_width(k)) / 2 - _NODE_GAP,
+                places=6,
+            )
         for k in kids[half:]:
-            self.assertEqual(pos[k["id"]][0], 240.0)
+            self.assertAlmostEqual(
+                pos[k["id"]][0],
+                (root_w + w._node_width(k)) / 2 + _NODE_GAP,
+                places=6,
+            )
 
     def test_level1_symmetric_left_right(self):
         """两翼布局下：一级子节点前一半左列、后一半右列，垂直错开。"""
-        _, pos = self._layout("columns")
+        w, pos = self._layout("columns")
         kids = self.children[self.children[None][0]["id"]]
         half = (len(kids) + 1) // 2
         left = [pos[k["id"]] for k in kids[:half]]
         right = [pos[k["id"]] for k in kids[half:]]
         self.assertEqual(len(left), len(right))  # 6 个一级 -> 3 左 3 右
-        for p in left:
-            self.assertEqual(p[0], -240.0)
-        for p in right:
-            self.assertEqual(p[0], 240.0)
+        self.assertTrue(all(p[0] < 0 for p in left))
+        self.assertTrue(all(p[0] > 0 for p in right))
         # 垂直错开：同列节点 y 各不相同（不再全部挤在根的水平线上）
         left_ys = [p[1] for p in left]
         right_ys = [p[1] for p in right]
         self.assertEqual(len(set(left_ys)), len(left))
         self.assertEqual(len(set(right_ys)), len(right))
+
+    def test_auto_layout_min_gap(self):
+        """自动布局时父子水平间距与兄弟垂直间距均至少保留 10px。"""
+        w, pos = self._layout("columns")
+
+        def check(parent_id):
+            for k in w._children.get(parent_id, []):
+                if parent_id is not None:
+                    px = pos[parent_id][0]
+                    cx = pos[k["id"]][0]
+                    h_gap = abs(cx - px) - (w._node_width(w._nodes[parent_id]) + w._node_width(k)) / 2
+                    self.assertGreaterEqual(h_gap, _NODE_GAP - 1e-6)
+                check(k["id"])
+
+            siblings = w._children.get(parent_id, [])
+            for prev, nxt in zip(siblings, siblings[1:]):
+                if abs(pos[prev["id"]][0] - pos[nxt["id"]][0]) < 1e-6:
+                    gap = pos[nxt["id"]][1] - pos[prev["id"]][1] - _NODE_H
+                    self.assertGreaterEqual(gap, _NODE_GAP - 1e-6)
+
+        check(None)
 
     def test_child_starts_at_parent_level(self):
         """子节点从父节点水平线向下排列：首个子节点与父节点同水平。"""
@@ -227,16 +259,25 @@ class TestLayout(unittest.TestCase):
         w._scale = 1.0
         w._node_pos = {}
         w._auto_layout_internal()
-        target_cx = w._node_pos[3][0] + _NODE_W / 2  # 目标中心 x
-        w._node_pos[2] = (target_cx - _NODE_W / 2 + 3.0, w._node_pos[2][1])
+        target_cx = w._node_pos[3][0] + w._node_width(b) / 2  # 目标中心 x
+        w._node_pos[2] = (target_cx - w._node_width(a) / 2 + 3.0, w._node_pos[2][1])
         vx, vy = w._snap_guides(2)
         self.assertIsNotNone(vx)
         self.assertAlmostEqual(vx, target_cx, places=6)
-        self.assertAlmostEqual(w._node_pos[2][0] + _NODE_W / 2, target_cx, places=6)
+        self.assertAlmostEqual(w._node_pos[2][0] + w._node_width(a) / 2, target_cx, places=6)
         # 远离时不对齐
-        w._node_pos[2] = (target_cx - _NODE_W / 2 + 5000.0, w._node_pos[2][1])
+        w._node_pos[2] = (target_cx - w._node_width(a) / 2 + 5000.0, w._node_pos[2][1])
         vx2, vy2 = w._snap_guides(2)
         self.assertIsNone(vx2)
+
+    def test_estimate_node_width_single_line(self):
+        """节点宽度按单行文字自动估算，长名称比短名称更宽。"""
+        short = estimate_node_width("资料分析")
+        long = estimate_node_width("逻辑填空（选词填空）")
+        self.assertGreater(long, short)
+        self.assertGreaterEqual(short, 120.0)
+        node = {"name": "短", "node_width": 300.0}
+        self.assertEqual(QuestionTypeMindmapWindow._node_width(node), 300.0)
 
 
 class TestMindmapStats(unittest.TestCase):

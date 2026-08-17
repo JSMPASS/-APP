@@ -35,8 +35,10 @@ _NODE_COLORS = {
 
 _RESULT_LABELS = {"correct": "正确", "wrong": "错误", None: "未判定"}
 
-_NODE_W = 170.0   # 节点宽（世界单位）
+_NODE_W = 170.0   # 节点默认宽（世界单位，兼容旧数据/纯布局计算）
 _NODE_H = 56.0    # 节点高（世界单位）
+_MIN_NODE_W = 120.0
+_NODE_GAP = 10.0  # 自动布局时节点之间至少保留的初始间距
 _MIN_SCALE = 0.3
 _MAX_SCALE = 3.0
 _ZOOM_STEP = 1.15
@@ -84,6 +86,17 @@ def round_rect_points(x, y, w, h, r):
     ]
 
 
+def estimate_node_width(name):
+    """按单行文字估算节点宽度（世界单位），中英文混合粗略按字符宽度计算。"""
+    text = (name or "").strip()
+    if not text:
+        return _NODE_W
+    width = 28.0
+    for ch in text:
+        width += 14.5 if ord(ch) > 0x2E7F else 7.5
+    return max(_MIN_NODE_W, width)
+
+
 class QuestionTypeMindmapWindow(tk.Frame):
     def __init__(self, master, db):
         super().__init__(master, bg=PALETTE["bg"])
@@ -103,6 +116,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         self._drag_subtree = []
         self._drag_orig = {}
         self._drag_anchor = (0, 0)
+        self._dirty = False
         self._pan_active = False
         self._pan_start = None
         self._pan_off0 = (0, 0)
@@ -122,6 +136,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
 
     def refresh(self):
         """主窗口切换页面时由 MainWindow 调用。"""
+        if self._dirty and self._map:
+            self._save_map(show_feedback=False)
         self._load_maps()
 
     # ---------- UI ----------
@@ -142,6 +158,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
         ttk.Button(row1, text="＋ 新增节点", style="Accent.TButton", command=self._add_node).pack(side="left", padx=4)
         ttk.Button(row1, text="编辑", command=self._edit_node).pack(side="left", padx=4)
         ttk.Button(row1, text="删除", command=self._delete_node).pack(side="left", padx=4)
+        self.save_btn = ttk.Button(row1, text="保存", command=self._save_map)
+        self.save_btn.pack(side="left", padx=4)
         ttk.Button(row1, text="展开全部", command=self._expand_all).pack(side="left", padx=4)
         ttk.Button(row1, text="折叠全部", command=self._collapse_all).pack(side="left", padx=4)
 
@@ -348,13 +366,27 @@ class QuestionTypeMindmapWindow(tk.Frame):
             self._select_node(prev_sel)
         else:
             self._clear_detail()
+        self._dirty = False
+        if hasattr(self, "save_btn"):
+            self.save_btn.configure(text="保存")
         self.canvas.focus_set()
 
     # ---------- 布局与绘制 ----------
-    _H_SPACING = 240.0   # 相邻层级水平间距（世界单位）
-    _V_STEP = 64.0       # 每棵叶子子树占用的垂直高度
-    _RADIAL_R1 = 260.0   # 放射布局：一级主题半径
-    _RADIAL_STEP = 230.0 # 放射布局：每层半径增量
+    _V_STEP = _NODE_H + _NODE_GAP   # 叶子行距：节点高 + 最小间距
+    _RADIAL_R1 = 260.0              # 放射布局：一级主题基础半径
+    _RADIAL_STEP = 230.0            # 放射布局：每层基础半径增量
+
+    @staticmethod
+    def _node_width(node):
+        """节点实际宽度：优先使用已保存的 node_width，否则按名称自动估算。"""
+        stored = node.get("node_width") if node else 0
+        if stored:
+            return max(float(stored), _MIN_NODE_W)
+        return estimate_node_width(node.get("name") if node else "")
+
+    def _h_spacing(self, parent, child):
+        """父子水平间距：保证两个节点边缘之间至少 _NODE_GAP。"""
+        return self._node_width(parent) / 2 + self._node_width(child) / 2 + _NODE_GAP
 
     def _subtree_height(self, node):
         if node.get("collapsed"):
@@ -384,16 +416,19 @@ class QuestionTypeMindmapWindow(tk.Frame):
             return
         cy = y
         for k in kids:
-            self._layout_node_at(k, x + direction * self._H_SPACING, cy, direction)
+            self._layout_node_at(k, x + direction * self._h_spacing(node, k), cy, direction)
             cy += self._subtree_height(k) * self._V_STEP
 
     def _layout_column(self, kids, direction):
         """一列一级节点：垂直堆叠（整体以根水平线为对称中心），子树沿 direction 展开。"""
+        roots = self._children.get(None, [])
+        root = roots[0] if roots else None
         total = sum(self._subtree_height(k) for k in kids) * self._V_STEP
         cy = -total / 2
         for k in kids:
             h = self._subtree_height(k) * self._V_STEP
-            self._layout_node_at(k, direction * self._H_SPACING, cy + h / 2, direction)
+            x = direction * self._h_spacing(root, k) if root else direction * _NODE_W
+            self._layout_node_at(k, x, cy + h / 2, direction)
             cy += h
 
     def _radial_layout(self):
@@ -428,14 +463,20 @@ class QuestionTypeMindmapWindow(tk.Frame):
                 return
             stotal = sum(self._leaf_count(k) for k in subs)
             a = mid_angle - span / 2
+            sub_step = max(
+                self._RADIAL_STEP,
+                max((self._node_width(node) + self._node_width(k)) / 2 for k in subs) + _NODE_GAP,
+            )
             for k in subs:
                 s = self._leaf_count(k) / stotal * span
-                place(k, a + s / 2, s, radius + self._RADIAL_STEP)
+                place(k, a + s / 2, s, radius + sub_step)
                 a += s
 
+        max_w = max((self._node_width(k) for k in active), default=_NODE_W)
+        r1 = max(self._RADIAL_R1, max_w + _NODE_GAP * 2)
         for k in active:
             span = self._leaf_count(k) / total * 360.0
-            place(k, angle + span / 2, span, self._RADIAL_R1)
+            place(k, angle + span / 2, span, r1)
             angle += span
 
     def _copy_free_subtree(self, node_id):
@@ -484,7 +525,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
             return
         xs = [p[0] for p in self._node_pos.values()]
         ys = [p[1] for p in self._node_pos.values()]
-        bcx = (min(xs) + max(xs) + _NODE_W) / 2
+        max_w = max((self._node_width(n) for n in self._nodes.values()), default=_NODE_W)
+        bcx = (min(xs) + max(xs) + max_w) / 2
         bcy = (min(ys) + max(ys) + _NODE_H) / 2
         w = max(self.canvas.winfo_width(), 600)
         h = max(self.canvas.winfo_height(), 400)
@@ -520,9 +562,10 @@ class QuestionTypeMindmapWindow(tk.Frame):
             parent = self._nodes.get(n["parent_id"])
             if not parent or parent.get("collapsed"):
                 continue
+            pw = self._node_width(parent)
             x1, y1 = world_to_screen(*self._node_pos.get(parent["id"], (0, 0)), scale, ox, oy)
             x2, y2 = world_to_screen(*self._node_pos.get(n["id"], (0, 0)), scale, ox, oy)
-            p0 = (x1 + _NODE_W * scale, y1 + _NODE_H * scale / 2)
+            p0 = (x1 + pw * scale, y1 + _NODE_H * scale / 2)
             p1 = (x2, y2 + _NODE_H * scale / 2)
             pts = bezier_curve(p0, p1)
             width, color = self._line_style(
@@ -553,7 +596,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
     def _draw_node(self, node, x, y):
         scale, ox, oy = self._scale, self._off_x, self._off_y
         color = self._node_color(node)
-        sw, sh = _NODE_W * scale, _NODE_H * scale
+        nw = self._node_width(node)
+        sw, sh = nw * scale, _NODE_H * scale
         sx, sy = world_to_screen(x, y, scale, ox, oy)
         is_root = node["parent_id"] is None
         selected = node["id"] == self._selected_id
@@ -570,10 +614,10 @@ class QuestionTypeMindmapWindow(tk.Frame):
             round_rect_points(sx, sy, sw, sh, 10 * scale),
             fill=fill, outline=outline, smooth=True,
             width=3 if selected else 2)
+        label = " ".join(str(node["name"] or "").split())
         text = self.canvas.create_text(sx + sw / 2, sy + sh / 2 - (8 if stat else 0),
-                                       text=node["name"], fill=fg,
-                                       font=("Microsoft YaHei UI", 12, "bold"),
-                                       width=max(40, int(150 * scale)))
+                                       text=label, fill=fg,
+                                       font=("Microsoft YaHei UI", 12, "bold"))
         self._node_items[rect] = node["id"]
         self._node_items[text] = node["id"]
         self._node_rect[node["id"]] = rect
@@ -682,6 +726,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
                 self._map["id"],
                 view_offset_x=self._off_x, view_offset_y=self._off_y,
             )
+            self._mark_dirty()
         self._pan_active = False
         self._pan_start = None
 
@@ -696,6 +741,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
             self._map["layout_mode"] = "manual"
         self.db.update_question_type_full(node_id, pos_x=x, pos_y=y, free_float=1)
         node["free_float"] = 1
+        self._mark_dirty()
 
     def _apply_struct_drop(self, drag_id, target_id, wy):
         """结构拖拽：同级时按 release 位置（目标上方/下方边缘=重排，中心=成为子节点）；
@@ -712,7 +758,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
                 ty = self._node_pos[target_id][1]
                 if wy < ty - 10:                      # 明显在目标上方 -> 插其前
                     self.db.move_question_type(drag_id, target["parent_id"], index)
-                elif wy > ty + _NODE_H + 10:          # 明显在目标下方 -> 插其后
+                elif wy > ty + _NODE_H + _NODE_GAP:    # 明显在目标下方 -> 插其后
                     self.db.move_question_type(drag_id, target["parent_id"], index + 1)
                 else:                                 # 目标中心区域 -> 成为其子节点
                     self.db.move_question_type(drag_id, target_id, None)
@@ -728,12 +774,14 @@ class QuestionTypeMindmapWindow(tk.Frame):
             self._auto_layout_internal()
             self._draw()
         self._select_node(drag_id)
+        self._mark_dirty()
 
     def _draw_drag_highlight(self, node_id):
         """拖拽目标高亮框（虚线 accent 色）。"""
         x, y = self._node_pos.get(node_id, (0, 0))
         sx, sy = world_to_screen(x, y, self._scale, self._off_x, self._off_y)
-        sw, sh = _NODE_W * self._scale, _NODE_H * self._scale
+        sw = self._node_width(self._nodes.get(node_id, {})) * self._scale
+        sh = _NODE_H * self._scale
         self.canvas.create_rectangle(sx - 4, sy - 4, sx + sw + 4, sy + sh + 4,
                                      outline=PALETTE["accent"], width=2, dash=(5, 3))
 
@@ -750,7 +798,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
         阈值按屏幕像素换算成世界单位，缩放后手感一致。
         """
         thr = 8.0 / self._scale
-        cx = self._node_pos[node_id][0] + _NODE_W / 2
+        nw = self._node_width(self._nodes.get(node_id, {}))
+        cx = self._node_pos[node_id][0] + nw / 2
         cy = self._node_pos[node_id][1] + _NODE_H / 2
         best_x = best_y = None
         dx_best = dy_best = thr
@@ -758,7 +807,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         for nid, (x, y) in self._node_pos.items():
             if nid == node_id or nid in hidden:
                 continue
-            tx = x + _NODE_W / 2
+            tx = x + self._node_width(self._nodes.get(nid, {})) / 2
             ty = y + _NODE_H / 2
             dx = abs(tx - cx)
             dy = abs(ty - cy)
@@ -767,7 +816,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
             if dy < dy_best:
                 dy_best, best_y = dy, ty
         if best_x is not None:
-            self._node_pos[node_id] = (best_x - _NODE_W / 2, self._node_pos[node_id][1])
+            self._node_pos[node_id] = (best_x - nw / 2, self._node_pos[node_id][1])
         if best_y is not None:
             self._node_pos[node_id] = (self._node_pos[node_id][0], best_y - _NODE_H / 2)
         return best_x, best_y
@@ -797,7 +846,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
         """画布内联编辑节点名：Enter 保存、Esc 取消、失焦保存。"""
         x, y = self._node_pos.get(node["id"], (0, 0))
         sx, sy = world_to_screen(x, y, self._scale, self._off_x, self._off_y)
-        sw, sh = _NODE_W * self._scale, _NODE_H * self._scale
+        sw = self._node_width(node) * self._scale
+        sh = _NODE_H * self._scale
         entry = tk.Entry(self.canvas, font=("Microsoft YaHei UI", 12),
                          justify="center", relief="solid")
         entry.insert(0, node["name"])
@@ -809,10 +859,15 @@ class QuestionTypeMindmapWindow(tk.Frame):
             val = entry.get().strip()
             entry.destroy()
             if val and val != node["name"]:
-                self.db.update_question_type_full(node["id"], name=val)
+                fields = {"name": val}
+                if not node.get("node_width"):
+                    fields["node_width"] = estimate_node_width(val)
+                self.db.update_question_type_full(node["id"], **fields)
                 node["name"] = val
+                node["node_width"] = fields.get("node_width", node.get("node_width"))
                 self._draw()
                 self._select_node(node["id"])
+                self._mark_dirty()
             return "break"
 
         def cancel(_e=None):
@@ -898,12 +953,14 @@ class QuestionTypeMindmapWindow(tk.Frame):
             self._map["layout_mode"] = "auto"
         self._load_current_map()
         self._select_node(node["id"])
+        self._mark_dirty()
 
     def _back_to_auto(self):
         """整图回到自动布局（自由主题保留原位）。"""
         if self._map:
             self.db.update_question_map(self._map["id"], layout_mode="auto")
             self._load_current_map()
+            self._mark_dirty()
 
     def _on_mousewheel(self, event):
         # 普通滚轮：垂直平移
@@ -941,6 +998,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         m["layout_type"] = lt  # 同步内存缓存（_current_map 读取它）
         m["layout_mode"] = "auto"
         self._load_current_map()
+        self._mark_dirty()
 
     def _fit_view(self):
         if not self._map:
@@ -955,6 +1013,43 @@ class QuestionTypeMindmapWindow(tk.Frame):
         )
         self._map["layout_mode"] = "auto"
         self._draw()
+        self._mark_dirty()
+
+    def _mark_dirty(self):
+        """标记存在尚未显式保存的布局调整，并给出可见提示。"""
+        self._dirty = True
+        if hasattr(self, "save_btn"):
+            self.save_btn.configure(text="● 保存")
+
+    def _save_map(self, show_feedback=True):
+        """把当前节点位置、宽度与视图状态一次性持久化，并显示保存反馈。"""
+        if not self._map:
+            return
+        try:
+            for nid, (x, y) in self._node_pos.items():
+                node = self._nodes.get(nid)
+                if not node:
+                    continue
+                self.db.update_question_type_full(
+                    nid,
+                    pos_x=float(x),
+                    pos_y=float(y),
+                    node_width=float(self._node_width(node)),
+                )
+            self.db.update_question_map(
+                self._map["id"],
+                layout_mode=self._map.get("layout_mode") or "auto",
+                view_scale=self._scale,
+                view_offset_x=self._off_x,
+                view_offset_y=self._off_y,
+            )
+        except Exception as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self)
+            return
+        self._dirty = False
+        self.save_btn.configure(text="保存")
+        if show_feedback:
+            self.summary.configure(text="已保存：节点位置、宽度与视图状态已写入数据库")
 
     def _import_preset(self):
         """把科目管理的知识点树导入当前科目的思维导图（幂等）。"""
@@ -1161,6 +1256,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         self.db.toggle_question_type_collapsed(node["id"])
         node["collapsed"] = 0 if node.get("collapsed") else 1  # 仅改折叠态，不重排布局
         self._draw()
+        self._mark_dirty()
 
     def _expand_all(self):
         if not self._map:
@@ -1169,6 +1265,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         for n in self._nodes.values():
             n["collapsed"] = 0
         self._draw()
+        self._mark_dirty()
 
     def _collapse_all(self):
         if not self._map:
@@ -1177,6 +1274,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         for n in self._nodes.values():
             n["collapsed"] = 1
         self._draw()
+        self._mark_dirty()
 
     def _subtree_size(self, node_id):
         total = 1
@@ -1248,6 +1346,24 @@ class NodeEditDialog(tk.Toplevel):
         tk.Label(row2, text="颜色值：", bg=P["bg"]).pack(side="left")
         ttk.Entry(row2, textvariable=self.color_var, width=12).pack(side="left")
 
+        row_w = tk.Frame(body, bg=P["bg"])
+        row_w.pack(fill="x", pady=3)
+        self.auto_width_var = tk.BooleanVar(value=not (self.node and self.node.get("node_width")))
+        self.width_var = tk.DoubleVar(
+            value=(self.node.get("node_width") if self.node and self.node.get("node_width")
+                   else estimate_node_width(self.node["name"] if self.node else "")))
+        self.auto_width_cb = ttk.Checkbutton(
+            row_w, text="自动宽度（文字单行）", variable=self.auto_width_var,
+            command=self._sync_width_state)
+        self.auto_width_cb.pack(side="left")
+        tk.Label(row_w, text="宽度：", bg=P["bg"]).pack(side="left", padx=(12, 0))
+        self.width_spin = ttk.Spinbox(row_w, from_=120, to=1200, increment=10,
+                                      textvariable=self.width_var, width=8)
+        self.width_spin.pack(side="left")
+        tk.Label(row_w, text="px", bg=P["bg"]).pack(side="left")
+        self.name_var.trace_add("write", lambda *a: self._auto_fit_width())
+        self._sync_width_state()
+
         row3 = tk.Frame(body, bg=P["bg"])
         row3.pack(fill="x", pady=3)
         tk.Label(row3, text="关联知识点：", bg=P["bg"]).pack(side="left")
@@ -1297,16 +1413,29 @@ class NodeEditDialog(tk.Toplevel):
         if color:
             self.color_var.set(color)
 
+    def _sync_width_state(self):
+        if self.auto_width_var.get():
+            self._auto_fit_width()
+            self.width_spin.configure(state="disabled")
+        else:
+            self.width_spin.configure(state="normal")
+
+    def _auto_fit_width(self):
+        if self.auto_width_var.get():
+            self.width_var.set(int(estimate_node_width(self.name_var.get())))
+
     def _save(self):
         name = self.name_var.get().strip()
         if not name:
             messagebox.showwarning("提示", "名称不能为空", parent=self)
             return
         topic_label = self.topic_var.get()
+        node_width = self.width_var.get()
         data = {
             "name": name,
             "node_type": self.type_var.get(),
             "color": self.color_var.get().strip(),
+            "node_width": node_width,
             "recognition": self.fields["recognition"].get("1.0", "end").strip(),
             "approach": self.fields["approach"].get("1.0", "end").strip(),
             "method": self.fields["method"].get("1.0", "end").strip(),
