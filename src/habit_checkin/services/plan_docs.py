@@ -305,6 +305,7 @@ def import_plan_document(db, path, overwrite=True):
     if not tasks:
         # 只有开始日期时，至少更新 plan_start_date，不重建计划
         db.set_setting("plan_start_date", start.isoformat())
+        db.set_setting("plan_source_file", db.rel_path(path))
         return {"start": start.isoformat(), "days": 0, "items": 0, "updated_start_only": True}
 
     created_days = created_items = 0
@@ -335,4 +336,5 @@ def import_plan_document(db, path, overwrite=True):
         db.conn.commit()
         created_days += 1
     db.set_setting("plan_start_date", start.isoformat())
+    db.set_setting("plan_source_file", db.rel_path(path))
     return {"start": start.isoformat(), "days": created_days, "items": created_items, "updated_start_only": False}

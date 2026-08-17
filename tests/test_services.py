@@ -14,6 +14,7 @@ from habit_checkin.services.collect import collect_image_questions, collect_ques
 from habit_checkin.services.motivation import random_quote
 from habit_checkin.services import ocr as ocr_module
 from habit_checkin.services.ocr import cleanup_cjk_spaces, format_questions_text, parse_ocr_questions, preprocess_for_ocr, reconstruct_page
+from habit_checkin.services import plan_docs
 
 
 class TestOcrCleanup(unittest.TestCase):
@@ -202,6 +203,39 @@ class TestCollectQuestionFromImage(unittest.TestCase):
         q = self.db.get_question(self.db.list_questions()[0]["id"])
         self.assertEqual(q["question_text"], "")
         self.assertEqual(len(q["images"]), 1)
+
+
+class TestPlanDocImport(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.db = Database(self.root / "app.db", self.root / "images", self.root)
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def test_import_saves_source_file(self):
+        md = self.root / "plan.md"
+        md.write_text(
+            "# 习惯打卡计划模板\n"
+            "- 开始日期：2026-08-01\n"
+            "## 每日任务\n"
+            "### 2026-08-01\n"
+            "- 09:30 | 大作文 | 主 | 写一篇\n",
+            encoding="utf-8",
+        )
+        result = plan_docs.import_plan_document(self.db, str(md))
+        self.assertFalse(result["updated_start_only"])
+        self.assertEqual(self.db.get_setting("plan_start_date"), "2026-08-01")
+        self.assertEqual(self.db.get_setting("plan_source_file"), "plan.md")
+
+    def test_start_only_import_saves_source_file(self):
+        md = self.root / "start.md"
+        md.write_text("# 习惯打卡计划模板\n- 开始日期：2026-08-10\n", encoding="utf-8")
+        result = plan_docs.import_plan_document(self.db, str(md))
+        self.assertTrue(result["updated_start_only"])
+        self.assertEqual(self.db.get_setting("plan_source_file"), "start.md")
 
 
 if __name__ == "__main__":

@@ -56,6 +56,31 @@ class TestDatabase(unittest.TestCase):
         self.assertIn("言语理解与表达", names)
         self.assertIn("逻辑填空（选词填空）", names)
 
+    def test_topic_kind_defaults_and_switching(self):
+        topics = self.db.list_topics()
+        self.assertTrue(all(t["kind"] == "category" for t in topics))
+        tid = self.db.ensure_topic_by_path(("行测", "全模块小测"))
+        row = self.db.conn.execute("SELECT kind FROM topics WHERE id=?", (tid,)).fetchone()
+        self.assertEqual(row["kind"], "method")
+        self.db.set_topic_kind(tid, "category")
+        self.assertEqual(
+            self.db.conn.execute("SELECT kind FROM topics WHERE id=?", (tid,)).fetchone()["kind"],
+            "category",
+        )
+        self.db.set_topic_kind(tid, "method")
+        self.assertEqual(
+            self.db.conn.execute("SELECT kind FROM topics WHERE id=?", (tid,)).fetchone()["kind"],
+            "method",
+        )
+        with self.assertRaises(ValueError):
+            self.db.set_topic_kind(tid, "other")
+
+    def test_migrate_topic_kinds_marks_known_methods(self):
+        tid = self.db.add_topic("自由补弱", kind="category")
+        self.db._migrate_topic_kinds()
+        row = self.db.conn.execute("SELECT kind FROM topics WHERE id=?", (tid,)).fetchone()
+        self.assertEqual(row["kind"], "method")
+
     def test_plan_and_checkin(self):
         day = "2026-08-11"
         pid = self.db.create_plan(day, "今日计划")
@@ -299,6 +324,36 @@ class TestDatabase(unittest.TestCase):
             self.db.update_question_type_full(a, parent_id=c)
         with self.assertRaises(ValueError):
             self.db.update_question_type_full(root["id"], parent_id=a)
+
+    def test_question_type_node_width(self):
+        tid = self.db.add_topic("WidthMapRoot")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == tid)
+        root = [n for n in self.db.question_types_by_map(m["id"]) if n["parent_id"] is None][0]
+        nid = self.db.add_question_type_full("长节点", parent_id=root["id"], map_id=m["id"],
+                                             node_width=260.0)
+        node = self.db.get_question_type(nid)
+        self.assertEqual(node["node_width"], 260.0)
+        self.db.update_question_type_full(nid, node_width=320.0)
+        self.assertEqual(self.db.get_question_type(nid)["node_width"], 320.0)
+
+    def test_import_preset_skips_method_topics(self):
+        root = self.db.add_topic("ImportMethodRoot")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        category = self.db.add_topic("分类节点", parent_id=root)
+        method = self.db.add_topic("自由补弱", parent_id=root)
+        self.db.add_topic("子做法", parent_id=method)
+        self.db.import_preset_question_types(m["id"])
+        nodes = self.db.question_types_by_map(m["id"])
+        names = [n["name"] for n in nodes]
+        self.assertIn("分类节点", names)
+        self.assertNotIn("自由补弱", names)
+        self.assertNotIn("子做法", names)
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) AS n FROM question_types WHERE topic_id=?", (category,)
+            ).fetchone()["n"],
+            1,
+        )
 
     def test_set_question_types_collapsed_batch(self):
         tid = self.db.add_topic("CollapseMapRoot")

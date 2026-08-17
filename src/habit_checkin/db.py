@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS topics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     parent_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'category',
     is_preset INTEGER NOT NULL DEFAULT 0,
     disabled INTEGER NOT NULL DEFAULT 0,
     sort_order INTEGER NOT NULL DEFAULT 0
@@ -106,6 +107,7 @@ CREATE TABLE IF NOT EXISTS question_types (
     method TEXT NOT NULL DEFAULT '',
     remark TEXT NOT NULL DEFAULT '',
     color TEXT NOT NULL DEFAULT '',
+    node_width REAL NOT NULL DEFAULT 0,
     pos_x REAL NOT NULL DEFAULT 0,
     pos_y REAL NOT NULL DEFAULT 0,
     collapsed INTEGER NOT NULL DEFAULT 0,
@@ -135,6 +137,17 @@ CREATE INDEX IF NOT EXISTS idx_qimages_question ON question_images(question_id);
 
 # 预置科目目录（叶子节点即打卡项）；版本升级时重建
 CURRENT_SEED_VERSION = 3
+
+# 具体做法：可出现在打卡计划中，但不作为「细分」参与题目分类，也不导入思维导图
+METHOD_TOPIC_NAMES = {
+    "自由补弱",
+    "行测套题",
+    "全模块小测",
+    "申论套题",
+    "知识学习",
+    "实践",
+}
+
 SEED_TOPICS = [
     ("行测", [
         ("政治理论", []),
@@ -170,6 +183,7 @@ class Database:
         self._init_schema()
         self._seed_topics()
         self._migrate_remove_cuoti_topic()
+        self._migrate_topic_kinds()
         self._seed_metrics()
         self._seed_question_types()
 
@@ -194,6 +208,10 @@ class Database:
          "ALTER TABLE question_types ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0"),
         ("question_types", "topic_id",
          "ALTER TABLE question_types ADD COLUMN topic_id INTEGER"),
+        ("question_types", "node_width",
+         "ALTER TABLE question_types ADD COLUMN node_width REAL NOT NULL DEFAULT 0"),
+        ("topics", "kind",
+         "ALTER TABLE topics ADD COLUMN kind TEXT NOT NULL DEFAULT 'category'"),
         ("question_maps", "topic_id",
          "ALTER TABLE question_maps ADD COLUMN topic_id INTEGER"),
         ("question_maps", "layout_mode",
@@ -265,6 +283,15 @@ class Database:
         self.conn.execute("UPDATE plan_items SET topic_id=? WHERE topic_id=?", (new_id, old["id"]))
         self.conn.execute("UPDATE questions SET topic_id=? WHERE topic_id=?", (new_id, old["id"]))
         self.conn.execute("DELETE FROM topics WHERE id=?", (old["id"],))
+        self.conn.commit()
+
+    def _migrate_topic_kinds(self):
+        """把已知的具体做法科目标记为 method，其余保持 category（幂等）。"""
+        placeholders = ",".join("?" * len(METHOD_TOPIC_NAMES))
+        self.conn.execute(
+            "UPDATE topics SET kind='method' WHERE name IN ({})".format(placeholders),
+            tuple(METHOD_TOPIC_NAMES),
+        )
         self.conn.commit()
 
 
@@ -382,7 +409,7 @@ class Database:
         if not root_node:
             return 0
         topics = self.conn.execute(
-            "SELECT id, parent_id, name, sort_order FROM topics"
+            "SELECT id, parent_id, name, sort_order, kind FROM topics"
         ).fetchall()
         by_parent = {}
         for t in topics:
@@ -401,6 +428,8 @@ class Database:
             nonlocal imported
             if topic["id"] in seen_topic or topic["name"] in seen_name:
                 return
+            if topic["kind"] == "method":
+                return  # 具体做法不入思维导图，其子节点一并跳过
             kids = by_parent.get(topic["id"], [])
             node_type = "category" if kids else "type"
             cur = self.conn.execute(
@@ -568,10 +597,14 @@ class Database:
 
         return {tid: build(tid) for tid in ids}
 
-    def add_topic(self, name, parent_id=None):
+    def add_topic(self, name, parent_id=None, kind=None):
         name = name.strip()
         if not name:
             raise ValueError("名称不能为空")
+        if kind is None:
+            kind = "method" if name in METHOD_TOPIC_NAMES else "category"
+        if kind not in ("category", "method"):
+            raise ValueError("科目类型必须是「具体分类」或「具体做法」")
         if parent_id is not None:
             row = self.conn.execute("SELECT id FROM topics WHERE id=?", (parent_id,)).fetchone()
             if not row:
@@ -585,14 +618,21 @@ class Database:
             (parent_id,),
         ).fetchone()["m"]
         cur = self.conn.execute(
-            "INSERT INTO topics(parent_id, name, is_preset, sort_order) VALUES (?,?,?,?)",
-            (parent_id, name, 0, max_order + 1),
+            "INSERT INTO topics(parent_id, name, kind, is_preset, sort_order) VALUES (?,?,?,?,?)",
+            (parent_id, name, kind, 0, max_order + 1),
         )
         self.conn.commit()
         if parent_id is None:
             self._ensure_map_for_topic(cur.lastrowid, name)
             self.conn.commit()
         return cur.lastrowid
+
+    def set_topic_kind(self, topic_id, kind):
+        """切换科目类型：category=具体分类（进入细分/思维导图），method=具体做法。"""
+        if kind not in ("category", "method"):
+            raise ValueError("科目类型必须是「具体分类」或「具体做法」")
+        self.conn.execute("UPDATE topics SET kind=? WHERE id=?", (kind, topic_id))
+        self.conn.commit()
 
     def rename_topic(self, topic_id, name):
         name = name.strip()
@@ -667,7 +707,7 @@ class Database:
                 out[path] = t["id"]
         return out
 
-    def ensure_topic_by_path(self, names):
+    def ensure_topic_by_path(self, names, kind=None):
         """按名称路径（根 → 叶）查找科目，不存在则逐级创建为自定义科目，返回末级 id。"""
         parent_id = None
         for raw in names:
@@ -687,7 +727,7 @@ class Database:
             if row:
                 parent_id = row["id"]
             else:
-                parent_id = self.add_topic(name, parent_id=parent_id)
+                parent_id = self.add_topic(name, parent_id=parent_id, kind=kind)
         return parent_id
 
     # ---------- 计划 ----------
@@ -1405,7 +1445,8 @@ class Database:
 
     def add_question_type_full(self, name, parent_id=None, node_type="type", map_id=None,
                                recognition="", approach="", method="", remark="",
-                               color="", pos_x=0, pos_y=0, collapsed=0, topic_id=None):
+                               color="", node_width=0, pos_x=0, pos_y=0, collapsed=0,
+                               topic_id=None):
         """新增题型节点（支持思维导图完整字段）。"""
         name = name.strip()
         if not name:
@@ -1422,18 +1463,18 @@ class Database:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cur = self.conn.execute(
             "INSERT INTO question_types(parent_id, map_id, name, node_type, recognition, approach, method, "
-            "remark, color, pos_x, pos_y, collapsed, topic_id, sort_order, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "remark, color, node_width, pos_x, pos_y, collapsed, topic_id, sort_order, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (parent_id, map_id, name, node_type, recognition or "", approach or "", method or "",
-             remark or "", color or "", float(pos_x or 0), float(pos_y or 0), 1 if collapsed else 0,
-             topic_id, max_order + 1, now, now),
+             remark or "", color or "", float(node_width or 0), float(pos_x or 0),
+             float(pos_y or 0), 1 if collapsed else 0, topic_id, max_order + 1, now, now),
         )
         self.conn.commit()
         return cur.lastrowid
 
     def update_question_type_full(self, qtype_id, **fields):
         allowed = {"name", "parent_id", "node_type", "recognition", "approach", "method",
-                   "remark", "color", "pos_x", "pos_y", "collapsed", "map_id", "topic_id",
+                   "remark", "color", "node_width", "pos_x", "pos_y", "collapsed", "map_id", "topic_id",
                    "free_float", "sort_order"}
         if "parent_id" in fields:
             node = self.get_question_type(qtype_id)
