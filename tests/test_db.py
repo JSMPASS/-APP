@@ -130,6 +130,37 @@ class TestDatabase(unittest.TestCase):
         self.db.delete_plan_item(iid)
         self.assertIsNone(self.db.get_plan_item(iid))
 
+    def test_clear_checkin_time_keeps_done_and_note(self):
+        pid = self.db.create_plan("2026-08-13")
+        iid = self.db.add_plan_item(pid, self._leaf("单一指标")["id"])
+        self.db.update_checkin(iid, "完成资料分析", done=True, checked_at="2026-08-13 10:20:00")
+        self.db.set_elapsed(iid, 1800)
+        self.db.clear_checked_at(iid)
+        item = self.db.get_plan_item(iid)
+        self.assertEqual(item["done"], 1)
+        self.assertEqual(item["note"], "完成资料分析")
+        self.assertIsNone(item["checked_at"])
+        self.assertEqual(item["elapsed_seconds"], 1800)
+
+    def test_reset_plan_item_restores_unchecked_state(self):
+        from PIL import Image
+        img_path = self.root / "reset.png"
+        Image.new("RGB", (30, 30)).save(img_path)
+        rel = self.db.store_image_from_path(str(img_path))
+        pid = self.db.create_plan("2026-08-13")
+        iid = self.db.add_plan_item(pid, self._leaf("大作文")["id"])
+        self.db.update_checkin(iid, "需要修正", done=True, checked_at="2026-08-13 21:00:00")
+        self.db.set_elapsed(iid, 3600)
+        self.db.add_image(iid, rel)
+        self.db.reset_plan_item(iid)
+        item = self.db.get_plan_item(iid)
+        self.assertEqual(item["done"], 0)
+        self.assertEqual(item["note"], "")
+        self.assertIsNone(item["checked_at"])
+        self.assertEqual(item["elapsed_seconds"], 0)
+        self.assertEqual(item["images"], [])
+        self.assertFalse(Path(self.db.abs_path(rel)).exists())
+
     def test_topic_paths_batch(self):
         root_id = self.db.add_topic("BatchRoot")
         child_id = self.db.add_topic("BatchChild", parent_id=root_id)

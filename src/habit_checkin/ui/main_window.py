@@ -18,6 +18,7 @@ from habit_checkin.ui.checkin_dialog import CheckinDialog
 from habit_checkin.ui.close_dialog import CloseChoiceDialog
 from habit_checkin.ui.progress_ring import ProgressRing
 from habit_checkin.ui.theme import PALETTE, apply_theme, card, dialog_header, hover_button, stat_card
+from habit_checkin.ui.theme_menu import ThemeMenu
 
 
 class SidebarApp(tk.Tk):
@@ -607,6 +608,7 @@ class TodayPage(tk.Frame):
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.tree.bind("<Double-1>", lambda e: self._checkin_selected())
+        self.tree.bind("<Button-3>", self._on_item_right_click)
 
         # 底部提示
         bar = tk.Frame(self, bg=P["bar"], padx=18, pady=6)
@@ -1039,6 +1041,67 @@ class TodayPage(tk.Frame):
         dlg = CheckinDialog(self.master, self.db, item, self.current_date.isoformat())
         self.wait_window(dlg)
         self.refresh()
+
+    # ---------- 已完成项右键清理 ----------
+    def _on_item_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        item = self.db.get_plan_item(int(iid))
+        if not item or not item["done"]:
+            return
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        item_id = int(iid)
+        menu = ThemeMenu(self)
+        self._menu = menu
+        menu.show(event.x_root, event.y_root, [
+            ("清除计时数据", lambda: self._clear_timing(item_id)),
+            ("清除打卡时间数据", lambda: self._clear_checkin_time(item_id)),
+            ("---",),
+            ("清除打卡数据（复原为未打卡）", lambda: self._reset_checkin(item_id), True),
+        ])
+
+    def _clear_timing(self, item_id):
+        ok = messagebox.askyesno(
+            "清除计时数据",
+            "确定清除该打卡项的计时数据吗？计时将归零。",
+            parent=self.master,
+        )
+        if not ok:
+            return
+        if self._timer_item_id == item_id:
+            self._timer_stop()
+        self.db.set_elapsed(item_id, 0)
+        self.refresh()
+        ui_toast(self.master, "已清除计时数据")
+
+    def _clear_checkin_time(self, item_id):
+        ok = messagebox.askyesno(
+            "清除打卡时间数据",
+            "确定清除该打卡项的打卡时间吗？完成状态会保留。",
+            parent=self.master,
+        )
+        if not ok:
+            return
+        self.db.clear_checked_at(item_id)
+        self.refresh()
+        ui_toast(self.master, "已清除打卡时间")
+
+    def _reset_checkin(self, item_id):
+        ok = messagebox.askyesno(
+            "清除打卡数据",
+            "确定清除该打卡项的全部打卡数据吗？\n"
+            "完成状态、打卡时间、文字总结、图片和计时都会复原为未打卡状态。",
+            parent=self.master,
+        )
+        if not ok:
+            return
+        if self._timer_item_id == item_id:
+            self._timer_stop()
+        self.db.reset_plan_item(item_id)
+        self.refresh()
+        ui_toast(self.master, "已复原为未打卡状态")
 
     def _export_range_fmt(self, fmt):
         day = self.current_date.isoformat()

@@ -909,6 +909,25 @@ class Database:
         )
         self.conn.commit()
 
+    def clear_checked_at(self, item_id):
+        """仅清空打卡时间，保留完成状态与总结。"""
+        self.conn.execute("UPDATE plan_items SET checked_at=NULL WHERE id=?", (item_id,))
+        self.conn.commit()
+
+    def reset_plan_item(self, item_id):
+        """把打卡项复原为未打卡：清除状态、时间、总结、图片与计时。"""
+        rows = self.conn.execute(
+            "SELECT file_path FROM checkin_images WHERE plan_item_id=?", (item_id,)
+        ).fetchall()
+        rels = {r["file_path"] for r in rows if r["file_path"]}
+        self.conn.execute("DELETE FROM checkin_images WHERE plan_item_id=?", (item_id,))
+        self.conn.execute(
+            "UPDATE plan_items SET done=0, note='', checked_at=NULL, elapsed_seconds=0 WHERE id=?",
+            (item_id,),
+        )
+        self.conn.commit()
+        self.delete_image_files(rels)
+
     def delete_plan_item(self, item_id):
         rows = self.conn.execute(
             "SELECT file_path FROM checkin_images WHERE plan_item_id=?", (item_id,)
