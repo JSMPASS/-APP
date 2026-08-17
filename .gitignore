@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+build/
+dist/
+*.spec
+.tmp_test/
+
+# User data and private study materials
+data/
+_data_backup_*/
+考公提取/
+_考公提取/
+公考真题整理/
+*学习计划.md
+考公资料分类整理.md
+*.db
+
+# Debug screenshots and scratch files
+baidu_*.png
+screen_*.png
+step1.png
+dump.js
+ocr_result.txt
+cleanup_pystray_files.cmd
