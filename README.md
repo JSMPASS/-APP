@@ -42,6 +42,7 @@
 ## 环境与依赖
 
 - Python 3.10+（自带 tkinter）。项目优先使用仓库内 `venv\Scripts\python.exe`，未创建虚拟环境时回退到系统 `python.exe`。
+- 若本机 Python 缺少可用的 Tcl/Tk 脚本目录，可把 `tcl8.6`、`tk8.6` 放到仓库根目录 `runtime\tcl` 下；启动与打包时应用会自动设置 `TCL_LIBRARY` / `TK_LIBRARY`。
 - 依赖：`python-docx`、`Pillow`、`reportlab`、`numpy`（离线可用，无需联网；`numpy` 用于 OCR 图片预处理与图形去背景）。
   - 系统托盘依赖：`pystray`（用于最小化到托盘）。
 

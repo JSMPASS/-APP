@@ -8,6 +8,7 @@ build/
 dist/
 *.spec
 .tmp_test/
+runtime/
 
 # User data and private study materials
 data/
@@ -15,6 +16,7 @@ _data_backup_*/
 考公提取/
 _考公提取/
 公考真题整理/
+1.考公_文件目录.txt
 *学习计划.md
 考公资料分类整理.md
 *.db

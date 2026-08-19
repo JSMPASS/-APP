@@ -297,9 +297,12 @@ class StudyProgressPage(tk.Frame):
             return
         s = cfg["stages"][index]
         values = self._ask_plan_item("编辑阶段", [
-            {"key": "name", "label": "阶段名称", "value": s["name"]},
-            {"key": "day_start", "label": "开始天数", "value": str(s["day_start"])},
-            {"key": "day_end", "label": "结束天数", "value": str(s["day_end"])},
+            {"key": "name", "label": "阶段名称", "value": s["name"], "required": True},
+            {"key": "day_start", "label": "开始天数", "type": "integer",
+             "value": str(s["day_start"]), "min": 1, "required": True},
+            {"key": "day_end", "label": "结束天数", "type": "integer",
+             "value": str(s["day_end"]), "min": 1, "max": cfg["total_days"],
+             "required": True},
             {"key": "xingce", "label": "行测内容", "value": s.get("xingce", ""),
              "multiline": True, "height": 3},
             {"key": "shenlun", "label": "申论内容", "value": s.get("shenlun", ""),
@@ -309,17 +312,10 @@ class StudyProgressPage(tk.Frame):
         ])
         if not values:
             return
-        try:
-            day_start = int(values["day_start"])
-            day_end = int(values["day_end"])
-        except ValueError:
-            messagebox.showwarning("编辑阶段", "开始/结束天数必须是数字。", parent=self)
-            return
-        if day_start < 1 or day_end < day_start:
+        day_start = values["day_start"]
+        day_end = values["day_end"]
+        if day_end < day_start:
             messagebox.showwarning("编辑阶段", "结束天数不能小于开始天数。", parent=self)
-            return
-        if day_end > cfg["total_days"]:
-            messagebox.showwarning("编辑阶段", "结束天数不能超过总天数 {}。".format(cfg["total_days"]), parent=self)
             return
         cfg["stages"][index] = {
             "name": values["name"] or s["name"],
@@ -336,7 +332,7 @@ class StudyProgressPage(tk.Frame):
         focus = next((f for wk, f in cfg["weeks"] if wk == week_num), "")
         values = self._ask_plan_item("编辑第 {} 周".format(week_num), [
             {"key": "focus", "label": "本周重点", "value": focus,
-             "multiline": True, "height": 4},
+             "multiline": True, "height": 4, "required": True},
         ])
         if not values:
             return
@@ -348,20 +344,15 @@ class StudyProgressPage(tk.Frame):
         cfg = get_plan_config(self.db)
         content = next((c for day, c in cfg["checkpoints"] if day == cp_day), "")
         values = self._ask_plan_item("编辑检查点 · 第 {} 天".format(cp_day), [
-            {"key": "day", "label": "检查天数", "value": str(cp_day)},
+            {"key": "day", "label": "检查天数", "type": "integer",
+             "value": str(cp_day), "min": 1, "max": cfg["total_days"],
+             "required": True},
             {"key": "content", "label": "检查内容", "value": content,
-             "multiline": True, "height": 4},
+             "multiline": True, "height": 4, "required": True},
         ])
         if not values:
             return
-        try:
-            new_day = int(values["day"])
-        except ValueError:
-            messagebox.showwarning("编辑检查点", "检查天数必须是数字。", parent=self)
-            return
-        if new_day < 1 or new_day > cfg["total_days"]:
-            messagebox.showwarning("编辑检查点", "检查天数需在 1 ~ {} 之间。".format(cfg["total_days"]), parent=self)
-            return
+        new_day = values["day"]
         cfg["checkpoints"] = [
             [new_day if day == cp_day else day, values["content"] if day == cp_day else content]
             for day, content in cfg["checkpoints"]
@@ -372,14 +363,12 @@ class StudyProgressPage(tk.Frame):
         cfg = get_plan_config(self.db)
         desc = next((d for t, d in cfg["daily_routine"] if t == tm), "")
         values = self._ask_plan_item("编辑作息 {}".format(tm), [
-            {"key": "time", "label": "时间", "value": tm},
-            {"key": "desc", "label": "内容", "value": desc, "multiline": True, "height": 4},
+            {"key": "time", "label": "时间", "type": "time", "value": tm,
+             "required": True},
+            {"key": "desc", "label": "内容", "value": desc,
+             "multiline": True, "height": 4, "required": True},
         ])
         if not values:
-            return
-        time_parts = values["time"].split(":")
-        if len(time_parts) != 2 or not all(p.isdigit() for p in time_parts):
-            messagebox.showwarning("编辑作息", "时间格式应为 HH:MM。", parent=self)
             return
         cfg["daily_routine"] = [
             [values["time"] if t == tm else t, values["desc"] if t == tm else d]

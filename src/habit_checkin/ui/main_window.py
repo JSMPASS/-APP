@@ -463,41 +463,41 @@ class TodayPage(tk.Frame):
         # 倒计时面板（独立卡片行，避免与统计横向拥挤；双击打开设置）
         cd_box = card(ov, padx=18, pady=18)
         cd_box.grid(row=0, column=1, sticky="nsew", padx=5)
-        cd = tk.Frame(cd_box, bg=P["surface"], height=140, cursor="hand2")
+        cd = tk.Frame(cd_box, bg=P["surface"], height=176, cursor="hand2")
         cd.pack(fill="both", expand=True)
         cd.pack_propagate(False)
         # 主行：标题（左）与天数（右），与左侧环中心同一水平线
         main = tk.Frame(cd, bg=P["surface"])
         main.place(relx=0.5, rely=0.5, anchor="center")
         self.countdown_ring = ProgressRing(main, size=76, thickness=8, color=P["primary"])
-        self.countdown_ring.pack(side="left", padx=(0, 16))
-        self.countdown_sub = tk.Label(main, text="双击设置目标日", bg=P["surface"],
-                                      fg=P["primary"], font=("Microsoft YaHei UI", 20, "bold"))
-        self.countdown_sub.pack(side="left")
-        num_row = tk.Frame(main, bg=P["surface"])
-        num_row.pack(side="left", padx=(18, 0))
+        self.countdown_ring.pack(side="left", padx=(0, 8))
+        text_col = tk.Frame(main, bg=P["surface"])
+        text_col.pack(side="left", fill="both", expand=True)
+        self.countdown_sub = tk.Label(text_col, text="双击设置目标日", bg=P["surface"],
+                                      fg=P["primary"], font=("Microsoft YaHei UI", 36, "bold"))
+        self.countdown_sub.pack(anchor="center")
+        num_row = tk.Frame(text_col, bg=P["surface"])
+        num_row.pack(pady=(2, 0))
         self.countdown_days = tk.Label(num_row, text="--", bg=P["surface"], fg=P["primary"],
-                                       font=("Microsoft YaHei UI", 27, "bold"))
+                                       font=("Microsoft YaHei UI", 30, "bold"))
         self.countdown_days.pack(side="left")
-        tk.Label(num_row, text="天", bg=P["surface"], fg=P["muted"],
-                 font=("Microsoft YaHei UI", 12)).pack(side="left", pady=(8, 0), padx=(0, 10))
         self.countdown_hours = tk.Label(num_row, text="--", bg=P["surface"], fg=P["primary_dark"],
-                                        font=("Microsoft YaHei UI", 16, "bold"))
-        self.countdown_hours.pack(side="left")
+                                        font=("Microsoft YaHei UI", 20, "bold"))
+        self.countdown_hours.pack(side="left", padx=(8, 0))
         tk.Label(num_row, text="小时", bg=P["surface"], fg=P["muted"],
-                 font=("Microsoft YaHei UI", 12)).pack(side="left", pady=(6, 0), padx=(0, 10))
+                 font=("Microsoft YaHei UI", 15)).pack(side="left", pady=(5, 0), padx=(0, 8))
         self.countdown_mins = tk.Label(num_row, text="--", bg=P["surface"], fg=P["primary_dark"],
-                                       font=("Microsoft YaHei UI", 16, "bold"))
-        self.countdown_mins.pack(side="left")
+                                       font=("Microsoft YaHei UI", 20, "bold"))
+        self.countdown_mins.pack(side="left", padx=(8, 0))
         tk.Label(num_row, text="分", bg=P["surface"], fg=P["muted"],
-                 font=("Microsoft YaHei UI", 12)).pack(side="left", pady=(6, 0))
+                 font=("Microsoft YaHei UI", 15)).pack(side="left", pady=(5, 0))
         # 说明：紧贴主行正上方居中
         tk.Label(cd, text="目标倒计时", bg=P["surface"], fg=P["muted"],
-                 font=("Microsoft YaHei UI", 13)).place(in_=main, relx=0.5, rely=0.0,
+                 font=("Microsoft YaHei UI", 10)).place(in_=main, relx=0.5, rely=0.0,
                                                        y=-6, anchor="s")
         # 日期 + 提示：位于主行正下方居中
         bot = tk.Frame(cd, bg=P["surface"])
-        bot.place(in_=main, relx=0.5, rely=1.0, y=6, anchor="n")
+        bot.place(in_=main, relx=0.5, rely=1.0, y=4, anchor="n")
         self.countdown_date = tk.Label(bot, text="", bg=P["surface"], fg=P["faint"],
                                        font=("Microsoft YaHei UI", 11))
         self.countdown_date.pack(side="left")
@@ -808,8 +808,8 @@ class TodayPage(tk.Frame):
         self.countdown_hours.configure(text=str(hours))
         self.countdown_mins.configure(text=str(mins))
         title = self.db.get_setting("countdown_title", "") or ""
-        if title and len(title) > 8:
-            title = title[:8] + "…"
+        if title and len(title) > 6:
+            title = title[:6] + "…"
         self.countdown_sub.configure(text=title if title else "距离目标日")
         self.countdown_date.configure(text=day_str + ("（已到期）" if expired else ""))
         self._start_pulse()

@@ -10,7 +10,7 @@ import time
 from datetime import date, datetime, timedelta
 
 TOTAL_DAYS = 90
-DEFAULT_START = date.today()        # 首次打开时默认从当天开始
+DEFAULT_START = date(2026, 8, 20)   # 90 天备考计划首日（2026-08-20）
 DEFAULT_END = DEFAULT_START + timedelta(days=TOTAL_DAYS - 1)
 
 
@@ -132,6 +132,8 @@ DAILY_ROUTINE = [
     ("13:30", "申论专题（袁东系统课 + 对应题型 1 题；周日为大作文日）"),
     ("15:00", "数量关系插空（周一/三/五） / 模块小测"),
     ("16:00", "错题复盘（ABCD 分类）+ 方法本整理"),
+    ("19:00", "收听新闻联播 + 记录时政要点"),
+    ("19:30", "ComfyUI / 软件编程创作（自由创作 2 小时）"),
     ("21:30", "明日计划、轻量收尾"),
     ("23:00", "睡觉"),
 ]
@@ -172,6 +174,9 @@ _MODULE_TOPIC = {
     "全模块小测": ("行测", "全模块小测"),
     "行测套题": ("行测", "行测套题"),
     "错题复盘": ("行测", "自由补弱"),
+    "当日重点整理": ("行测", "知识学习"),
+    "新闻联播": ("行测", "知识学习"),
+    "创作": ("行测", "实践"),
     "自由补弱": ("行测", "自由补弱"),
 }
 
@@ -236,6 +241,10 @@ def checkpoint_for(day, checkpoints=None):
 
 def resolve_topic(db, label, day=1):
     """把任务标签解析为科目 id；特殊科目缺失时自动创建为自定义科目。"""
+    if label in ("当日重点整理", "新闻联播"):
+        return db.ensure_topic_by_path(("行测", "知识学习"), kind="method")
+    if label == "创作":
+        return db.ensure_topic_by_path(("行测", "实践"), kind="method")
     if label in _MODULE_TOPIC:
         return db.ensure_topic_by_path(_MODULE_TOPIC[label])
     if label in _SHENLUN_TOPIC:
@@ -248,7 +257,8 @@ def resolve_topic(db, label, day=1):
 def build_daily_tasks(weekday, day=1, config=None):
     """返回某天（星期几）的任务列表 [(task_type, label, reminder_time), ...]。
 
-    每天固定 3 主 + 1 辅；周一/三/五额外插入「数量关系插空」；
+    每天固定 3 主 + 4~5 辅；周一/三/五额外插入「数量关系插空」；
+    16:00 固定错题复盘/当日重点整理，19:00 新闻联播，19:30 创作；
     冲刺阶段（默认第 61 天起）行测转向套题模考、申论转向套题。
     """
     cfg = normalize_plan_config(config)
@@ -279,6 +289,12 @@ def build_daily_tasks(weekday, day=1, config=None):
     ]
     if weekday in (0, 2, 4):  # 周一/三/五 数量插空
         tasks.insert(4, ("aux", "数量", "15:00"))
+    review_label = "当日重点整理" if weekday == 6 else "错题复盘"
+    tasks.extend([
+        ("aux", review_label, "16:00"),
+        ("aux", "新闻联播", "19:00"),
+        ("aux", "创作", "19:30"),
+    ])
     return tasks
 
 
@@ -393,7 +409,13 @@ def generate_90day_plan(db, start_date, overwrite=False, progress_cb=None, cance
             elif label == "行测套题":
                 note = "行测套题（限时120分钟）+ 涂卡"
             elif label == "错题复盘":
-                note = "错题ABCD分类 + 方法本整理"
+                note = "错题ABCD分类 + 当日重点整理 + 方法本整理"
+            elif label == "当日重点整理":
+                note = "当日重点整理 + 方法本整理"
+            elif label == "新闻联播":
+                note = "收听新闻联播 + 记录时政要点"
+            elif label == "创作":
+                note = "ComfyUI / 软件编程创作（自由创作 2 小时）"
             elif label == "自由补弱":
                 note = "薄弱模块自由补强"
             elif label == "政治理论·常识积累":

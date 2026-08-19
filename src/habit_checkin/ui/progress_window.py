@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import messagebox, ttk
 
 from habit_checkin.ui.animate import count_up, fade_in
 from habit_checkin.ui.common import center_window, setup_styles
+from habit_checkin.ui.field_edit_dialog import ask_fields
 from habit_checkin.ui.progress_ring import ProgressRing
 from habit_checkin.ui.theme import PALETTE, card, dialog_header
 
@@ -194,12 +195,17 @@ class ProgressWindow(tk.Frame):
         if not m:
             return
         cur = int(m["target"]) if m.get("target") is not None else 0
-        val = simpledialog.askinteger(
-            "设置目标", "「{}」的目标值：".format(m["name"]),
-            parent=self, initialvalue=max(cur, 0), minvalue=0,
+        values = ask_fields(
+            self, "设置目标", [
+                {"key": "target", "label": "目标值", "type": "integer",
+                 "value": str(max(cur, 0)) if cur > 0 else "", "min": 0,
+                 "required": True},
+            ],
+            subtitle="「{}」目标（{}）；留空表示取消目标".format(
+                m["name"], m.get("unit") or "次"),
         )
-        if val is not None:
-            self.db.set_metric_target(mid, val)
+        if values is not None:
+            self.db.set_metric_target(mid, values["target"])
             self._refresh()
 
     def _manage(self):
@@ -232,18 +238,11 @@ class ManageMetricsDialog(tk.Toplevel):
         add.pack(fill="x", padx=14, pady=(14, 6))
         tk.Label(add, text="新增自定义指标", bg=P["surface"], fg=P["text"],
                  font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        row = tk.Frame(add, bg=P["surface"])
-        row.pack(fill="x", pady=(6, 0))
-        tk.Label(row, text="名称：", bg=P["surface"]).pack(side="left")
-        self.name_entry = ttk.Entry(row, width=14)
-        self.name_entry.pack(side="left", padx=(0, 8))
-        tk.Label(row, text="单位：", bg=P["surface"]).pack(side="left")
-        self.unit_entry = ttk.Entry(row, width=6)
-        self.unit_entry.pack(side="left", padx=(0, 8))
-        tk.Label(row, text="目标：", bg=P["surface"]).pack(side="left")
-        self.target_entry = ttk.Entry(row, width=8)
-        self.target_entry.pack(side="left", padx=(0, 8))
-        ttk.Button(row, text="添加", style="Accent.TButton", command=self._add).pack(side="left")
+        ttk.Button(add, text="＋ 新增指标", style="Accent.TButton",
+                   command=self._add).pack(anchor="w", pady=(6, 0))
+        tk.Label(add, text="统一表单填写指标名称、单位与目标值。",
+                 bg=P["surface"], fg=P["muted"],
+                 font=("Microsoft YaHei UI", 11)).pack(anchor="w", pady=(4, 0))
 
         self.list_frame = tk.Frame(self, bg=P["bg"], padx=14, pady=6)
         self.list_frame.pack(fill="both", expand=True)
@@ -271,46 +270,55 @@ class ManageMetricsDialog(tk.Toplevel):
         kind = "内置" if m["kind"] == "builtin" else "自定义"
         tk.Label(row, text="{}（{}）".format(m["name"], kind), bg=P["surface"], fg=P["text"],
                  font=("Microsoft YaHei UI", 13, "bold")).pack(side="left", padx=6)
-        tk.Label(row, text="目标：", bg=P["surface"], fg=P["muted"]).pack(side="left", padx=(10, 0))
-        target_var = tk.StringVar(
-            value="{}".format(int(m["target"]) if m["target"] is not None else ""))
-        ent = ttk.Entry(row, textvariable=target_var, width=8)
-        ent.pack(side="left", padx=(0, 6))
-        ttk.Button(row, text="保存",
-                   command=lambda mid=m["id"], v=target_var: self._save_target(mid, v)
+        target_text = "目标 {} {}".format(
+            int(m["target"]), m.get("unit") or ""
+        ) if m["target"] is not None and int(m["target"]) > 0 else "未设目标"
+        tk.Label(row, text=target_text, bg=P["surface"], fg=P["muted"]
+                 ).pack(side="left", padx=(10, 0))
+        ttk.Button(row, text="设目标",
+                   command=lambda mid=m["id"]: self._set_target(mid)
                    ).pack(side="left", padx=4)
         if m["kind"] == "custom":
             ttk.Button(row, text="删除",
                        command=lambda mid=m["id"]: self._delete(mid)).pack(side="left", padx=4)
-
-    def _save_target(self, mid, var):
-        val = var.get().strip()
-        try:
-            target = int(val) if val else None
-        except ValueError:
-            messagebox.showwarning("目标值", "目标值应为整数或留空。", parent=self)
-            return
-        self.db.set_metric_target(mid, target)
 
     def _delete(self, mid):
         if messagebox.askyesno("删除指标", "确定删除该自定义指标吗？", parent=self):
             self.db.delete_metric(mid)
             self._refresh()
 
+    def _set_target(self, mid):
+        m = next((x for x in self.db.metric_values() if x["id"] == mid), None)
+        if not m:
+            return
+        cur = int(m["target"]) if m.get("target") is not None else 0
+        values = ask_fields(
+            self, "设置目标", [
+                {"key": "target", "label": "目标值", "type": "integer",
+                 "value": str(max(cur, 0)) if cur > 0 else "", "min": 0,
+                 "required": True},
+            ],
+            subtitle="「{}」目标（{}）；留空表示取消目标".format(
+                m["name"], m.get("unit") or "次"),
+        )
+        if values is not None:
+            self.db.set_metric_target(mid, values["target"])
+            self._refresh()
+
     def _add(self):
-        name = self.name_entry.get().strip()
-        if not name:
-            messagebox.showwarning("新增指标", "请填写指标名称。", parent=self)
+        values = ask_fields(
+            self, "新增自定义指标", [
+                {"key": "name", "label": "指标名称", "required": True,
+                 "placeholder": "例如：每日刷题数"},
+                {"key": "unit", "label": "单位", "placeholder": "例如：题"},
+                {"key": "target", "label": "目标值", "type": "integer",
+                 "min": 0},
+            ],
+            subtitle="新增后出现在总体进度卡片中",
+        )
+        if not values:
             return
-        unit = self.unit_entry.get().strip()
-        val = self.target_entry.get().strip()
-        try:
-            target = int(val) if val else None
-        except ValueError:
-            messagebox.showwarning("目标值", "目标值应为整数或留空。", parent=self)
-            return
-        self.db.add_custom_metric(name, unit, target)
-        self.name_entry.delete(0, "end")
-        self.unit_entry.delete(0, "end")
-        self.target_entry.delete(0, "end")
+        self.db.add_custom_metric(
+            values["name"].strip(), values["unit"].strip(), values["target"]
+        )
         self._refresh()

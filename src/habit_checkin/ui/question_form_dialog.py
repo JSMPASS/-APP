@@ -8,6 +8,7 @@ from tkinter import filedialog, messagebox, ttk
 from habit_checkin.services.ocr import format_questions_text, normalize_ocr_text, ocr_image_lines, parse_ocr_questions, reconstruct_page, split_figure_stems
 from habit_checkin.ui.common import ScrollableFrame, TextCheck, center_window, make_thumbnail, setup_styles, show_image_zoom
 from habit_checkin.ui.animate import fade_in
+from habit_checkin.ui.field_edit_dialog import FieldTextArea
 from habit_checkin.ui.theme import PALETTE, dialog_header, hover_button
 
 REASONS_CORRECT = ["完全理解", "蒙对"]
@@ -98,9 +99,7 @@ class QuestionFormDialog(tk.Toplevel):
         q_frame.pack(fill="both", expand=True, pady=(0, 8))
         tk.Label(q_frame, text="题目内容（可 OCR 识别后核对修改）：", bg=P["card"], fg=P["text"],
                  font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        self.question_text = tk.Text(q_frame, height=6, wrap="word", font=("Microsoft YaHei UI", 13),
-                                     bg=P["input"], fg=P["text"], relief="flat", highlightthickness=1,
-                                     highlightbackground=P["border"], highlightcolor=P["primary"])
+        self.question_text = FieldTextArea(q_frame, height=6)
         self.question_text.pack(fill="both", expand=True, pady=(4, 0))
 
         a_frame = tk.Frame(body, bg=P["card"], padx=12, pady=10,
@@ -108,9 +107,7 @@ class QuestionFormDialog(tk.Toplevel):
         a_frame.pack(fill="both", expand=True, pady=(0, 8))
         tk.Label(a_frame, text="题目解析：", bg=P["card"], fg=P["text"],
                  font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        self.analysis_text = tk.Text(a_frame, height=5, wrap="word", font=("Microsoft YaHei UI", 13),
-                                     bg=P["input"], fg=P["text"], relief="flat", highlightthickness=1,
-                                     highlightbackground=P["border"], highlightcolor=P["primary"])
+        self.analysis_text = FieldTextArea(a_frame, height=5)
         self.analysis_text.pack(fill="both", expand=True, pady=(4, 0))
 
         # 图片 + OCR

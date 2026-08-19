@@ -13,6 +13,7 @@ from habit_checkin.services.export_pdf import default_filename_pdf, export_pdf
 from habit_checkin.ui.export_dialog import ExportFormatDialog
 from habit_checkin.ui.common import ScrollableFrame, center_window, make_thumbnail, setup_styles, show_image_zoom
 from habit_checkin.ui.animate import fade_in
+from habit_checkin.ui.field_edit_dialog import FieldEditDialog, FieldTextArea
 from habit_checkin.ui.theme import PALETTE, dialog_header
 from habit_checkin.ui.theme_menu import ThemeMenu
 
@@ -244,10 +245,7 @@ class DetailWindow(tk.Toplevel):
 
         note_frame = ttk.LabelFrame(self, text="文字总结", padding=8)
         note_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-        txt = tk.Text(note_frame, wrap="word", height=8, font=("Microsoft YaHei UI", 13),
-                      bg=PALETTE["input"], fg=PALETTE["text"], relief="flat", highlightthickness=1,
-                      highlightbackground=PALETTE["border"], insertbackground=PALETTE["text"])
-        txt.insert("1.0", item["note"] or "（未填写）")
+        txt = FieldTextArea(note_frame, text=item["note"] or "（未填写）", height=8)
         txt.configure(state="disabled")
         txt.pack(fill="both", expand=True)
 
@@ -284,66 +282,47 @@ class DetailWindow(tk.Toplevel):
         fade_in(self)
 
 
-class EditItemDialog(tk.Toplevel):
-    """编辑单条历史记录：文字总结、完成状态与打卡时间。"""
+class EditItemDialog(FieldEditDialog):
+    """编辑单条历史记录：统一字段表单保存文字总结、完成状态与打卡时间。"""
 
     def __init__(self, master, db, item):
-        super().__init__(master, bg=PALETTE["bg"])
         self.db = db
         self.item = item
-        self.title("编辑打卡记录")
-        self.geometry("560x520")
-        self.transient(master)
-        setup_styles(self)
-        self.configure(bg=PALETTE["bg"])
-        dialog_header(self, "编辑打卡记录", item["plan_date"])
-
-        head = ttk.Frame(self, padding=(12, 10))
-        head.pack(fill="x")
-        ttk.Label(head, text=item["topic_path"], font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
-
-        note_frame = ttk.LabelFrame(self, text="文字总结", padding=8)
-        note_frame.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-        self.note_text = tk.Text(
-            note_frame, wrap="word", height=8, font=("Microsoft YaHei UI", 13),
-            bg=PALETTE["input"], fg=PALETTE["text"], relief="flat", highlightthickness=1,
-            highlightbackground=PALETTE["border"], insertbackground=PALETTE["text"],
+        checked = item["checked_at"] or ""
+        fields = [
+            {"key": "note", "label": "文字总结", "type": "multiline",
+             "height": 8, "value": item["note"] or ""},
+            {"key": "done", "label": "状态", "type": "bool",
+             "value": bool(item["done"]), "check_text": "已完成"},
+            {"key": "checked_at", "label": "打卡时间", "type": "time",
+             "value": checked[11:16] if item["done"] else "",
+             "placeholder": "HH:MM"},
+        ]
+        super().__init__(
+            master, "编辑打卡记录", fields,
+            subtitle="{} · {}".format(item["plan_date"], item["topic_path"]),
         )
-        self.note_text.insert("1.0", item["note"] or "")
-        self.note_text.pack(fill="both", expand=True)
 
-        status_frame = ttk.LabelFrame(self, text="状态", padding=10)
-        status_frame.pack(fill="x", padx=12, pady=(0, 8))
-        self.done_var = tk.BooleanVar(value=bool(item["done"]))
-        ttk.Checkbutton(status_frame, text="已完成", variable=self.done_var).pack(side="left")
-        ttk.Label(status_frame, text="打卡时间（HH:MM）：").pack(side="left", padx=(20, 4))
-        self.time_var = tk.StringVar(value=(item["checked_at"] or "")[11:16] if item["done"] else "")
-        ttk.Entry(status_frame, textvariable=self.time_var, width=8).pack(side="left")
-
-        bottom = tk.Frame(self, bg=PALETTE["bg"], padx=12, pady=10)
-        bottom.pack(fill="x")
-        ttk.Button(bottom, text="取消", command=self.destroy).pack(side="right")
-        ttk.Button(bottom, text="保存", style="Accent.TButton", command=self._save).pack(side="right", padx=8)
-        center_window(self)
-        fade_in(self)
-        self.grab_set()
-
-    def _save(self):
-        note = self.note_text.get("1.0", "end").strip()
-        done = bool(self.done_var.get())
-        time_str = self.time_var.get().strip()
+    def _save(self, event=None):
+        values = self._collect_values()
+        errors = self._validate_values(values)
+        if errors:
+            self._show_errors(errors)
+            return
+        done = bool(values["done"])
+        time_str = values["checked_at"]
         if done:
             if not time_str:
                 time_str = datetime.now().strftime("%H:%M")
-            parts = time_str.split(":")
-            if len(parts) != 2 or not all(p.isdigit() for p in parts):
-                messagebox.showwarning("编辑打卡记录", "打卡时间格式应为 HH:MM。", parent=self)
-                return
-            base_date = (self.item.get("checked_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))[:10]
+            base_date = (
+                self.item.get("checked_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )[:10]
             checked_at = "{} {}:00".format(base_date, time_str)
         else:
             checked_at = None
         self.db.update_checkin(
-            self.item["id"], note, done=done, checked_at=checked_at, preserve_time=False
+            self.item["id"], values["note"], done=done,
+            checked_at=checked_at, preserve_time=False,
         )
+        self.result = values
         self.destroy()

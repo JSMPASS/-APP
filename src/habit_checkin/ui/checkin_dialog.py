@@ -12,6 +12,7 @@ from habit_checkin.services.ocr import ocr_image_lines
 from habit_checkin.services.split import split_question_lines
 from habit_checkin.ui.common import ScrollableFrame, center_window, make_thumbnail, setup_styles, show_image_zoom
 from habit_checkin.ui.animate import fade_in, slide_in
+from habit_checkin.ui.field_edit_dialog import FieldTextArea
 from habit_checkin.ui.theme import PALETTE, dialog_header
 from habit_checkin.ui.question_form_dialog import QuestionFormDialog
 from habit_checkin.ui.reflection_window import ReflectionFormDialog
@@ -71,10 +72,7 @@ class CheckinDialog(tk.Toplevel):
 
         note_frame = ttk.LabelFrame(self, text="文字总结（学习内容、心得、完成情况等）", padding=8)
         note_frame.pack(fill="both", expand=True, padx=12, pady=(4, 8))
-        self.note_text = tk.Text(note_frame, height=8, wrap="word", font=("Microsoft YaHei UI", 13),
-                            bg=PALETTE["input"], fg=PALETTE["text"], relief="flat", highlightthickness=1,
-                            highlightbackground=PALETTE["border"], highlightcolor=PALETTE["primary"],
-                            insertbackground=PALETTE["text"])
+        self.note_text = FieldTextArea(note_frame, height=8)
         self.note_text.pack(fill="both", expand=True)
         if self.item.get("note"):
             self.note_text.insert("1.0", self.item["note"])

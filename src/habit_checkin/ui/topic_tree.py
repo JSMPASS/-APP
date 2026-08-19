@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import time
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox
 
+from habit_checkin.ui.field_edit_dialog import ask_fields
 from habit_checkin.ui.theme_menu import ThemeMenu
 
 
@@ -168,12 +169,12 @@ class TopicTreeMixin:
             ]
             if row["is_preset"]:
                 items.append((
-                    "✎ 重命名（预置不可改）",
-                    lambda: messagebox.showinfo("重命名", "预置科目不支持重命名，可新增自定义科目代替。", parent=self),
+                    "✎ 重命名（系统默认不可改）",
+                    lambda: messagebox.showinfo("重命名", "系统默认科目不支持重命名，可新增自定义科目代替。", parent=self),
                 ))
                 items.append((
-                    "✕ 删除（预置不可删）",
-                    lambda: messagebox.showinfo("删除", "预置科目不支持删除，可改用「停用/启用」隐藏。", parent=self),
+                    "✕ 删除（系统默认不可删）",
+                    lambda: messagebox.showinfo("删除", "系统默认科目不支持删除，可改用「停用/启用」隐藏。", parent=self),
                     True,
                 ))
             else:
@@ -188,9 +189,16 @@ class TopicTreeMixin:
         menu.show(event.x_root, event.y_root, items)
 
     def _add_root(self):
-        name = simpledialog.askstring("新增科目", "科目名称：", parent=self)
-        if not name:
+        values = ask_fields(
+            self, "新增科目", [
+                {"key": "name", "label": "科目名称", "required": True,
+                 "placeholder": "例如：资料分析"},
+            ],
+            subtitle="新增后将出现在科目管理中",
+        )
+        if not values:
             return
+        name = values["name"].strip()
         try:
             self.db.add_topic(name, parent_id=None)
         except ValueError as exc:
@@ -198,9 +206,16 @@ class TopicTreeMixin:
         self._refresh_tree()
 
     def _add_child_for(self, parent_id):
-        name = simpledialog.askstring("新增子知识点", "知识点名称：", parent=self)
-        if not name:
+        values = ask_fields(
+            self, "新增子知识点", [
+                {"key": "name", "label": "知识点名称", "required": True,
+                 "placeholder": "例如：单一指标"},
+            ],
+            subtitle="新建后将作为该科目的子知识点",
+        )
+        if not values:
             return
+        name = values["name"].strip()
         try:
             self.db.add_topic(name, parent_id=parent_id)
         except ValueError as exc:
@@ -209,9 +224,17 @@ class TopicTreeMixin:
 
     def _rename_for(self, topic_id):
         row = self.db.conn.execute("SELECT name FROM topics WHERE id=?", (topic_id,)).fetchone()
-        name = simpledialog.askstring("重命名", "新名称：", initialvalue=row["name"] if row else "", parent=self)
-        if not name:
+        values = ask_fields(
+            self, "重命名知识点", [
+                {"key": "name", "label": "新名称", "required": True,
+                 "value": row["name"] if row else "",
+                 "placeholder": "输入新的名称"},
+            ],
+            subtitle="修改后将同步到计划、思维导图与细分查询",
+        )
+        if not values:
             return
+        name = values["name"].strip()
         try:
             self.db.rename_topic(topic_id, name)
         except ValueError as exc:

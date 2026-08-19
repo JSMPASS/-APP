@@ -36,13 +36,24 @@ class TestDatabase(unittest.TestCase):
             "判断推理", "图形推理", "定义判断", "类比推理", "逻辑判断",
             "资料分析", "单一指标", "和差型指标", "分数型指标", "乘积型指标",
             "概括题", "综合分析题", "公文写作题", "提出对策题", "大作文",
+            "自由补弱", "行测套题", "全模块小测", "申论套题",
         ]:
             self.assertIn(expected, names)
         self.assertEqual([t["name"] for t in self.db.root_topics()], ["行测", "申论"])
         hangce = self._leaf("行测")
         kids = sorted([t for t in topics if t["parent_id"] == hangce["id"]], key=lambda x: x["sort_order"])
         self.assertEqual([k["name"] for k in kids],
-                         ["政治理论", "常识判断", "言语理解与表达", "数量关系", "判断推理", "资料分析"])
+                         ["政治理论", "常识判断", "言语理解与表达", "数量关系", "判断推理",
+                          "资料分析", "自由补弱", "行测套题", "全模块小测"])
+        shenlun = self._leaf("申论")
+        skids = sorted([t for t in topics if t["parent_id"] == shenlun["id"]], key=lambda x: x["sort_order"])
+        self.assertEqual([k["name"] for k in skids],
+                         ["概括题", "综合分析题", "公文写作题", "提出对策题", "大作文", "申论套题"])
+        self.assertEqual(
+            {k["name"]: k["kind"] for k in kids + skids
+             if k["name"] in ("自由补弱", "行测套题", "全模块小测", "申论套题")},
+            {"自由补弱": "method", "行测套题": "method", "全模块小测": "method", "申论套题": "method"},
+        )
         zl = self._leaf("资料分析")
         zkids = sorted([t for t in topics if t["parent_id"] == zl["id"]], key=lambda x: x["sort_order"])
         self.assertEqual([k["name"] for k in zkids], ["单一指标", "和差型指标", "分数型指标", "乘积型指标"])
@@ -58,7 +69,9 @@ class TestDatabase(unittest.TestCase):
 
     def test_topic_kind_defaults_and_switching(self):
         topics = self.db.list_topics()
-        self.assertTrue(all(t["kind"] == "category" for t in topics))
+        method_names = {"自由补弱", "行测套题", "全模块小测", "申论套题"}
+        for t in topics:
+            self.assertEqual(t["kind"], "method" if t["name"] in method_names else "category")
         tid = self.db.ensure_topic_by_path(("行测", "全模块小测"))
         row = self.db.conn.execute("SELECT kind FROM topics WHERE id=?", (tid,)).fetchone()
         self.assertEqual(row["kind"], "method")
@@ -80,6 +93,20 @@ class TestDatabase(unittest.TestCase):
         self.db._migrate_topic_kinds()
         row = self.db.conn.execute("SELECT kind FROM topics WHERE id=?", (tid,)).fetchone()
         self.assertEqual(row["kind"], "method")
+
+    def test_ensure_method_topics_idempotent(self):
+        def method_rows():
+            return self.db.conn.execute(
+                "SELECT name, parent_id, kind, sort_order FROM topics "
+                "WHERE name IN ('自由补弱', '行测套题', '全模块小测', '申论套题') "
+                "ORDER BY sort_order, id"
+            ).fetchall()
+
+        before = [tuple(r) for r in method_rows()]
+        self.db._migrate_ensure_method_topics()
+        after = [tuple(r) for r in method_rows()]
+        self.assertEqual(after, before)
+        self.assertEqual(len(before), 4)
 
     def test_category_subtopic_paths_skips_methods(self):
         root = self.db.add_topic("分类科目")
@@ -111,6 +138,7 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(item["done"], 1)
         self.assertEqual(item["note"], "完成 30 道逻辑填空")
         self.assertEqual(item["topic_path"], "行测 / 言语理解与表达 / 逻辑填空（选词填空）")
+        self.assertEqual(item["plan_date"], day)
         rows = self.db.query_items("2026-08-01", "2026-08-31")
         self.assertEqual(len(rows), 1)
 
@@ -219,7 +247,7 @@ class TestDatabase(unittest.TestCase):
         self.assertIsNotNone(q)
         self.assertIsNone(q["topic_id"])
         self.assertEqual(q["question_text"], "保留到未分类")
-        self.assertEqual(len(self.db.list_topics(include_disabled=True)), 26)
+        self.assertEqual(len(self.db.list_topics(include_disabled=True)), 30)
 
     def test_settings(self):
         self.assertTrue(self.db.get_bool_setting("sound_enabled", True))
@@ -403,11 +431,14 @@ class TestDatabase(unittest.TestCase):
         m = next(x for x in self.db.list_question_maps() if x["topic_id"] == tid)
         root = [n for n in self.db.question_types_by_map(m["id"]) if n["parent_id"] is None][0]
         nid = self.db.add_question_type_full("长节点", parent_id=root["id"], map_id=m["id"],
-                                             node_width=260.0)
+                                             node_width=260.0, auto_width=0)
         node = self.db.get_question_type(nid)
         self.assertEqual(node["node_width"], 260.0)
-        self.db.update_question_type_full(nid, node_width=320.0)
-        self.assertEqual(self.db.get_question_type(nid)["node_width"], 320.0)
+        self.assertEqual(node["auto_width"], 0)
+        self.db.update_question_type_full(nid, node_width=320.0, auto_width=1)
+        node = self.db.get_question_type(nid)
+        self.assertEqual(node["node_width"], 320.0)
+        self.assertEqual(node["auto_width"], 1)
 
     def test_import_preset_skips_method_topics(self):
         root = self.db.add_topic("ImportMethodRoot")

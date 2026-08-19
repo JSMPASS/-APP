@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,12 @@ def close_running_app():
 
 
 def build():
+    tcl = ROOT / "runtime" / "tcl" / "tcl8.6"
+    tk = ROOT / "runtime" / "tcl" / "tk8.6"
+    if (tcl / "init.tcl").is_file():
+        os.environ.setdefault("TCL_LIBRARY", str(tcl))
+        if (tk / "tk.tcl").is_file():
+            os.environ.setdefault("TK_LIBRARY", str(tk))
     close_running_app()
     if DIST.exists():
         shutil.rmtree(DIST)
@@ -96,5 +103,7 @@ def create_shortcut(exe):
 
 
 if __name__ == "__main__":
-    fresh_init()
+    # 默认保留原有“全新初始化”行为；传 --no-fresh 可跳过清空开发态 data
+    if "--no-fresh" not in sys.argv:
+        fresh_init()
     build()

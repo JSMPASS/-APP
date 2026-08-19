@@ -27,11 +27,17 @@ class TestStudyPlanHelpers(unittest.TestCase):
 
     def test_build_daily_tasks(self):
         monday = sp.build_daily_tasks(0)
-        self.assertEqual(len(monday), 5)  # 周一含数量插空
+        self.assertEqual(len(monday), 8)  # 3 主 + 5 辅（含数量插空）
         self.assertEqual(sum(1 for t in monday if t[0] == "main"), 3)
         self.assertEqual(sp.build_daily_tasks(1)[3][1], "归纳概括")  # 周二申论（day=1 → 概括期）
         self.assertEqual(sp.build_daily_tasks(6)[3][1], "大作文")   # 周日大作文
-        self.assertEqual(len(sp.build_daily_tasks(1)), 4)           # 周二无数量插空
+        self.assertEqual(len(sp.build_daily_tasks(1)), 7)           # 周二无数量插空
+        self.assertEqual(len(sp.build_daily_tasks(6)), 7)           # 周日固定 7 项
+        # 固定辅助任务每天都保留
+        for tasks in (monday, sp.build_daily_tasks(1), sp.build_daily_tasks(6)):
+            self.assertIn(("aux", "新闻联播", "19:00"), tasks)
+            self.assertIn(("aux", "创作", "19:30"), tasks)
+            self.assertTrue(any(t[0] == "aux" and t[2] == "16:00" for t in tasks))
         # 每日任务按提醒时间升序，保证界面/生成顺序就是一天的执行顺序
         for tasks in (monday, sp.build_daily_tasks(1), sp.build_daily_tasks(6)):
             times = [t[2] for t in tasks]

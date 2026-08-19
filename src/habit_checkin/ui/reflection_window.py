@@ -10,6 +10,7 @@ from habit_checkin.db import validate_date
 from habit_checkin.services.export_common import result_text
 from habit_checkin.ui.calendar import attach_calendar_on_click
 from habit_checkin.ui.common import center_window, setup_styles
+from habit_checkin.ui.field_edit_dialog import FieldTextArea
 from habit_checkin.ui.theme import PALETTE, dialog_header
 from habit_checkin.ui.animate import fade_in
 from habit_checkin.ui.topic_colors import configure_topic_tags, topic_tag
@@ -254,10 +255,7 @@ class ReflectionFormDialog(tk.Toplevel):
             frame.pack(fill="both", expand=True, pady=(0, 8))
             tk.Label(frame, text=label, bg=P["card"], fg=P["text"],
                      font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-            txt = tk.Text(frame, height=height, wrap="word", font=("Microsoft YaHei UI", 13),
-                          bg=P["input"], fg=P["text"], relief="flat", highlightthickness=1,
-                          highlightbackground=P["border"], highlightcolor=P["primary"])
-            txt.insert("1.0", question.get(key) or "")
+            txt = FieldTextArea(frame, text=question.get(key) or "", height=height)
             txt.pack(fill="both", expand=True, pady=(4, 0))
             self.fields[key] = txt
 

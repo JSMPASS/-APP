@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from habit_checkin.services import autostart
+from habit_checkin.ui.field_edit_dialog import ask_fields
 from habit_checkin.ui.theme import PALETTE, dialog_header
 from habit_checkin.ui.topic_tree import TopicTreeMixin
 
@@ -44,9 +45,7 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
         focus_row = tk.Frame(tab, bg=PALETTE["bg"])
         focus_row.pack(anchor="w", pady=(12, 0))
         tk.Label(focus_row, text="专注提醒间隔（分钟）：", bg=PALETTE["bg"]).pack(side="left")
-        self.focus_var = tk.StringVar(value=self.db.get_setting("focus_minutes", "45"))
-        ttk.Spinbox(focus_row, from_=0, to=180, width=5, textvariable=self.focus_var).pack(side="left", padx=(0, 6))
-        ttk.Button(focus_row, text="保存", command=self._save_focus).pack(side="left")
+        ttk.Button(focus_row, text="设置", command=self._edit_focus).pack(side="left", padx=(0, 6))
         ttk.Label(tab, text="打卡计时达到设定时长后弹休息提醒；设为 0 关闭。",
                   style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
         ttk.Label(
@@ -95,7 +94,7 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
                  "（拖到分类上成为其子项）。\n"
                  "具体分类会进入思维导图和细分查询；\n"
                  "具体做法仅用于生成计划，不入导图。\n"
-                 "预置科目只能停用；\n"
+                 "系统默认科目只能停用；\n"
                  "自定义科目可重命名、删除。\n"
                  "删除会连带清理相关记录与图片。",
             style="Hint.TLabel",
@@ -113,10 +112,8 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
         def add(parent_iid, t):
             iid = "t{}".format(t["id"])
             state = "停用" if t["disabled"] else "启用"
-            preset = "预置" if t["is_preset"] else "自定义"
             kind = "具体做法" if t["kind"] == "method" else "具体分类"
-            typ = "{} · {}".format(preset, kind)
-            self.tree.insert(parent_iid, "end", iid=iid, text=t["name"], values=(typ, state), open=True)
+            self.tree.insert(parent_iid, "end", iid=iid, text=t["name"], values=(kind, state), open=True)
             for kid in children.get(t["id"], []):
                 add(iid, kid)
 
@@ -197,14 +194,19 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
             style="Hint.TLabel",
         ).pack(anchor="w", pady=(4, 0))
 
-    def _save_focus(self):
-        try:
-            minutes = int(self.focus_var.get().strip())
-        except ValueError:
-            messagebox.showwarning("专注提醒", "请输入整数分钟数。", parent=self)
+    def _edit_focus(self):
+        current = self.db.get_setting("focus_minutes", "45")
+        values = ask_fields(
+            self, "专注提醒间隔", [
+                {"key": "minutes", "label": "专注提醒间隔（分钟）",
+                 "type": "integer", "value": current, "min": 0, "max": 180,
+                 "required": True},
+            ],
+            subtitle="打卡计时达到设定时长后弹休息提醒；设为 0 关闭",
+        )
+        if not values:
             return
-        self.db.set_setting("focus_minutes", str(max(0, minutes)))
-        messagebox.showinfo("已保存", "专注提醒间隔已更新。", parent=self)
+        self.db.set_setting("focus_minutes", str(values["minutes"]))
 
     def _save_close_action(self):
         self.db.set_setting("close_action", self.close_action_var.get())

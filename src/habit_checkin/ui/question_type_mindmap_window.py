@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import math
 import tkinter as tk
-from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from habit_checkin.services.mindmap_export import export_mindmap_markdown
 from habit_checkin.ui.animate import lerp_color
-from habit_checkin.ui.common import center_window, setup_styles
+from habit_checkin.ui.common import setup_styles
+from habit_checkin.ui.field_edit_dialog import FieldEditDialog, ask_fields
 from habit_checkin.ui.theme import PALETTE, dialog_header
 from habit_checkin.ui.theme_menu import ThemeMenu
 
@@ -24,7 +25,8 @@ _NODE_TYPE_LABELS = {
     "type": "题型",
 }
 
-_LAYOUT_LABELS = {"radial": "环形放射", "columns": "两翼对称", "logic": "右向逻辑图"}
+_DEFAULT_LAYOUT = "logic"
+_LAYOUT_LABELS = {"logic": "右向逻辑图", "radial": "环形放射", "columns": "两翼对称"}
 
 _NODE_COLORS = {
     "root": "#2D6CDF",
@@ -38,7 +40,19 @@ _RESULT_LABELS = {"correct": "正确", "wrong": "错误", None: "未判定"}
 _NODE_W = 170.0   # 节点默认宽（世界单位，兼容旧数据/纯布局计算）
 _NODE_H = 56.0    # 节点高（世界单位）
 _MIN_NODE_W = 120.0
-_NODE_GAP = 10.0  # 自动布局时节点之间至少保留的初始间距
+_MIN_GAP = 20.0  # 自动布局时任意两节点边缘之间至少保留的水平/垂直间距
+_NODE_TEXT_LEFT = 30.0
+_NODE_TEXT_RIGHT = 18.0
+_NODE_ICON_R = 6.0
+_TOOLBAR_FONT = ("Microsoft YaHei UI", 12)
+_TOOLBAR_BTN_PAD = (12, 8)
+_TOOLBAR_GAP = 8
+_NODE_ICON_KINDS = {
+    "root": "circle",
+    "subject": "diamond",
+    "category": "square",
+    "type": "dot",
+}
 _MIN_SCALE = 0.3
 _MAX_SCALE = 3.0
 _ZOOM_STEP = 1.15
@@ -76,6 +90,12 @@ def bezier_curve(p0, p1, steps=20):
     return pts
 
 
+def branch_curve(p0, p1):
+    """圆角分支线：水平进出、中间垂直过渡，交由 Canvas 平滑成圆角。"""
+    mid_x = (p0[0] + p1[0]) / 2.0
+    return [p0, (mid_x, p0[1]), (mid_x, p1[1]), p1]
+
+
 def round_rect_points(x, y, w, h, r):
     """圆角矩形多边形点列（create_polygon 用，配合 smooth=True 更圆润）。"""
     r = min(max(r, 0), w / 2, h / 2)
@@ -91,7 +111,7 @@ def estimate_node_width(name):
     text = (name or "").strip()
     if not text:
         return _NODE_W
-    width = 28.0
+    width = _NODE_TEXT_LEFT + _NODE_TEXT_RIGHT
     for ch in text:
         width += 14.5 if ord(ch) > 0x2E7F else 7.5
     return max(_MIN_NODE_W, width)
@@ -148,39 +168,78 @@ class QuestionTypeMindmapWindow(tk.Frame):
         top = tk.Frame(self, bg=P["bg"], padx=14, pady=8)
         top.pack(fill="x")
 
-        row1 = tk.Frame(top, bg=P["bg"])
-        row1.pack(fill="x", pady=(0, 6))
-        tk.Label(row1, text="科目：", bg=P["bg"]).pack(side="left")
+        # 两行工具栏：自动布局固定位于「新增节点」正下方，右侧功能依次后移。
+        grid = tk.Frame(top, bg=P["bg"])
+        grid.pack(fill="x", pady=(0, 6))
+        grid.columnconfigure(0, minsize=150)
+
+        toolbar_style = ttk.Style(self)
+        toolbar_style.configure(
+            "Toolbar.TButton", font=_TOOLBAR_FONT, padding=_TOOLBAR_BTN_PAD,
+        )
+        toolbar_style.configure(
+            "Toolbar.Accent.TButton", font=_TOOLBAR_FONT, padding=_TOOLBAR_BTN_PAD,
+            background=P["primary"], foreground="#FFFFFF", bordercolor=P["primary"],
+            lightcolor=P["primary"], darkcolor=P["primary"], focuscolor=P["primary"],
+        )
+        toolbar_style.map(
+            "Toolbar.Accent.TButton",
+            background=[("active", P["primary_hover"]), ("pressed", P["primary_active"]),
+                        ("disabled", P["primary_disabled"])],
+            foreground=[("disabled", P["primary_disabled_fg"])],
+        )
+        toolbar_style.configure("Toolbar.TCombobox", font=_TOOLBAR_FONT, padding=5)
+        toolbar_style.configure("Toolbar.TEntry", font=_TOOLBAR_FONT, padding=5)
+
+        def toolbar_button(text, command, column, row=0, style=None, pady=(0, 0)):
+            btn = ttk.Button(
+                grid, text=text, command=command,
+                style=style or "Toolbar.TButton",
+            )
+            btn.grid(row=row, column=column, sticky="w", padx=_TOOLBAR_GAP, pady=pady)
+            return btn
+
+        subject = tk.Frame(grid, bg=P["bg"])
+        subject.grid(row=0, column=0, sticky="w", padx=(0, 10), pady=(0, 10))
+        tk.Label(subject, text="科目：", bg=P["bg"], font=_TOOLBAR_FONT).pack(side="left")
         self.map_var = tk.StringVar()
-        self.map_box = ttk.Combobox(row1, textvariable=self.map_var, state="readonly", width=12)
-        self.map_box.pack(side="left", padx=(0, 10))
+        self.map_box = ttk.Combobox(
+            subject, textvariable=self.map_var, state="readonly", width=12,
+            style="Toolbar.TCombobox",
+        )
+        self.map_box.pack(side="left", padx=(2, 0))
         self.map_box.bind("<<ComboboxSelected>>", lambda e: self._load_current_map())
 
-        ttk.Button(row1, text="＋ 新增节点", style="Accent.TButton", command=self._add_node).pack(side="left", padx=4)
-        ttk.Button(row1, text="编辑", command=self._edit_node).pack(side="left", padx=4)
-        ttk.Button(row1, text="删除", command=self._delete_node).pack(side="left", padx=4)
-        self.save_btn = ttk.Button(row1, text="保存", command=self._save_map)
-        self.save_btn.pack(side="left", padx=4)
-        ttk.Button(row1, text="展开全部", command=self._expand_all).pack(side="left", padx=4)
-        ttk.Button(row1, text="折叠全部", command=self._collapse_all).pack(side="left", padx=4)
+        toolbar_button("＋ 新增节点", self._add_node, 1, style="Toolbar.Accent.TButton",
+                       pady=(0, 10))
+        toolbar_button("编辑", self._edit_node, 2, pady=(0, 10))
+        toolbar_button("删除", self._delete_node, 3, pady=(0, 10))
+        self.save_btn = toolbar_button("保存", self._save_map, 4, pady=(0, 10))
+        toolbar_button("展开全部", self._expand_all, 5, pady=(0, 10))
+        toolbar_button("折叠全部", self._collapse_all, 6, pady=(0, 10))
 
-        row2 = tk.Frame(top, bg=P["bg"])
-        row2.pack(fill="x")
-        ttk.Button(row2, text="自动布局", command=self._fit_view).pack(side="left", padx=4)
-        tk.Label(row2, text="布局：", bg=P["bg"]).pack(side="left", padx=(12, 0))
+        toolbar_button("自动布局", self._fit_view, 1, row=1)
+        tk.Label(grid, text="布局：", bg=P["bg"], font=_TOOLBAR_FONT).grid(
+            row=1, column=2, sticky="e")
         self.layout_var = tk.StringVar()
-        self.layout_box = ttk.Combobox(row2, textvariable=self.layout_var, state="readonly", width=10,
-                                       values=list(_LAYOUT_LABELS.values()))
-        self.layout_box.pack(side="left", padx=(0, 8))
+        self.layout_box = ttk.Combobox(
+            grid, textvariable=self.layout_var, state="readonly", width=10,
+            values=list(_LAYOUT_LABELS.values()), style="Toolbar.TCombobox",
+        )
+        self.layout_box.grid(row=1, column=3, sticky="w", padx=_TOOLBAR_GAP)
         self.layout_box.bind("<<ComboboxSelected>>", lambda e: self._set_layout())
-        ttk.Button(row2, text="导入节点", command=self._import_preset).pack(side="left", padx=4)
-        tk.Label(row2, text="搜索：", bg=P["bg"]).pack(side="left", padx=(12, 0))
+        toolbar_button("导入节点", self._import_preset, 4, row=1)
+        search = tk.Frame(grid, bg=P["bg"])
+        search.grid(row=1, column=5, sticky="w", padx=_TOOLBAR_GAP)
+        tk.Label(search, text="搜索：", bg=P["bg"], font=_TOOLBAR_FONT).pack(side="left")
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(row2, textvariable=self.search_var, width=12)
-        self.search_entry.pack(side="left", padx=(0, 4))
+        self.search_entry = ttk.Entry(
+            search, textvariable=self.search_var, width=12, style="Toolbar.TEntry",
+        )
+        self.search_entry.pack(side="left", padx=(2, 0))
         self.search_entry.bind("<Return>", self._search_nodes)
-        ttk.Button(row2, text="定位", command=self._search_nodes).pack(side="left", padx=(0, 4))
-        ttk.Button(row2, text="导出", command=self._export).pack(side="right")
+        toolbar_button("定位", self._search_nodes, 6, row=1)
+        toolbar_button("导出", self._export, 7, row=1)
 
         body = tk.Frame(self, bg=P["bg"])
         body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
@@ -349,7 +408,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
         self._search_idx = 0
         self._last_search = ""
         self._calc_depths()
-        self.layout_var.set(_LAYOUT_LABELS.get(m.get("layout_type") or "radial", "环形放射"))
+        self.layout_var.set(_LAYOUT_LABELS.get(
+            m.get("layout_type") or _DEFAULT_LAYOUT, _LAYOUT_LABELS[_DEFAULT_LAYOUT]))
         if m.get("layout_mode") == "manual":
             self._node_pos = {
                 n["id"]: (n.get("pos_x") or 0, n.get("pos_y") or 0) for n in self._nodes.values()
@@ -373,21 +433,24 @@ class QuestionTypeMindmapWindow(tk.Frame):
         self.canvas.focus_set()
 
     # ---------- 布局与绘制 ----------
-    _V_STEP = _NODE_H + _NODE_GAP   # 叶子行距：节点高 + 最小间距
+    _V_STEP = _NODE_H + _MIN_GAP    # 叶子行距：节点高 + 最小间距
     _RADIAL_R1 = 260.0              # 放射布局：一级主题基础半径
     _RADIAL_STEP = 230.0            # 放射布局：每层基础半径增量
+    _RADIAL_FILL = 0.92             # 放射布局：允许占满整圆的角向比例
 
     @staticmethod
     def _node_width(node):
-        """节点实际宽度：优先使用已保存的 node_width，否则按名称自动估算。"""
+        """节点实际宽度：自动宽度按名称实时估算，手动宽度使用已保存值。"""
+        if node and node.get("auto_width", 1):
+            return estimate_node_width(node.get("name") if node else "")
         stored = node.get("node_width") if node else 0
         if stored:
             return max(float(stored), _MIN_NODE_W)
         return estimate_node_width(node.get("name") if node else "")
 
     def _h_spacing(self, parent, child):
-        """父子水平间距：保证两个节点边缘之间至少 _NODE_GAP。"""
-        return self._node_width(parent) / 2 + self._node_width(child) / 2 + _NODE_GAP
+        """父子水平间距：保证两个节点边缘之间至少 _MIN_GAP。"""
+        return self._node_width(parent) / 2 + self._node_width(child) / 2 + _MIN_GAP
 
     def _subtree_height(self, node):
         if node.get("collapsed"):
@@ -406,35 +469,140 @@ class QuestionTypeMindmapWindow(tk.Frame):
             return 1
         return sum(self._leaf_count(c) for c in children)
 
-    def _layout_node_at(self, node, x, y, direction):
-        """把节点放到 (x, y)，子树沿 direction（±1）方向水平展开、
-        子节点从父节点水平线开始依次向下排列（首个子节点与父同水平）。"""
-        self._node_pos[node["id"]] = (x, y)
+    def _subtree_bbox_size(self, node):
+        """子树静态包围盒估算：宽度含父边距，高度按子子树纵向堆叠。"""
+        w = self._node_width(node)
         if node.get("collapsed"):
-            return
+            return w, _NODE_H
         kids = self._children.get(node["id"], [])
         if not kids:
-            return
+            return w, _NODE_H
+        sizes = [self._subtree_bbox_size(k) for k in kids]
+        cw = max(s[0] for s in sizes)
+        ch = sum(s[1] for s in sizes) + _MIN_GAP * (len(sizes) - 1)
+        return max(w, w + _MIN_GAP + cw), max(_NODE_H, ch)
+
+    def _logic_bbox_height(self, node):
+        """平衡右向布局中子树垂直包围盒高度（折叠子树按单节点计）。"""
+        if node.get("collapsed"):
+            return _NODE_H
+        kids = self._children.get(node["id"], [])
+        if not kids:
+            return _NODE_H
+        return sum(self._logic_bbox_height(k) for k in kids) \
+            + _MIN_GAP * (len(kids) - 1)
+
+    def _layout_logic_subtree_balanced(self, node, x, center_y, direction):
+        """把子树放到 (x, center_y)，父节点中线与子分支组中线对齐。
+
+        返回子树垂直包围盒 (top, bottom)，兄弟子树之间至少保留 _MIN_GAP。
+        """
+        nw = self._node_width(node)
+        self._node_pos[node["id"]] = (x, center_y - _NODE_H / 2.0)
+        top = center_y - _NODE_H / 2.0
+        bottom = center_y + _NODE_H / 2.0
+        if node.get("collapsed"):
+            return top, bottom
+        kids = self._children.get(node["id"], [])
+        if not kids:
+            return top, bottom
+        total = sum(self._logic_bbox_height(k) for k in kids) \
+            + _MIN_GAP * (len(kids) - 1)
+        child_top = center_y - total / 2.0
+        group_bottom = center_y + total / 2.0
+        for k in kids:
+            kh = self._logic_bbox_height(k)
+            kcenter = child_top + kh / 2.0
+            kw = self._node_width(k)
+            kx = x + nw + _MIN_GAP if direction > 0 else x - kw - _MIN_GAP
+            kbox = self._layout_logic_subtree_balanced(
+                k, kx, kcenter, direction)
+            child_top = kbox[1] + _MIN_GAP
+            top = min(top, kbox[0])
+            group_bottom = max(group_bottom, kbox[1])
+        return top, group_bottom
+
+    def _layout_logic_subtree(self, node, x, y, direction):
+        """把子树放到 (x, y) 并递归展开，返回该子树当前包围盒。
+
+        首个子节点与父节点顶边对齐；兄弟子树按包围盒高度依次向下排布，
+        任意同级子树之间的垂直间距至少 _MIN_GAP。两翼对称布局使用。
+        """
+        nw = self._node_width(node)
+        self._node_pos[node["id"]] = (x, y)
+        own = (x, y, x + nw, y + _NODE_H)
+        if node.get("collapsed"):
+            return own
+        kids = self._children.get(node["id"], [])
+        if not kids:
+            return own
+        minx, maxx = x, x + nw
+        maxy = y + _NODE_H
         cy = y
         for k in kids:
-            self._layout_node_at(k, x + direction * self._h_spacing(node, k), cy, direction)
-            cy += self._subtree_height(k) * self._V_STEP
+            kw = self._node_width(k)
+            kx = x + nw + _MIN_GAP if direction > 0 else x - kw - _MIN_GAP
+            kbox = self._layout_logic_subtree(k, kx, cy, direction)
+            minx = min(minx, kbox[0])
+            maxx = max(maxx, kbox[2])
+            maxy = max(maxy, kbox[3])
+            cy = max(cy, kbox[3] + _MIN_GAP)
+        return minx, y, maxx, maxy
+
+    def _layout_logic_branches(self, kids):
+        """右向逻辑图：一级分支组围绕根节点水平中线上下对称展开。"""
+        if not kids:
+            return
+        root = self._children.get(None, [None])[0]
+        root_w = self._node_width(root) if root else _NODE_W
+        total = sum(self._logic_bbox_height(k) for k in kids) \
+            + _MIN_GAP * (len(kids) - 1)
+        child_top = _NODE_H / 2.0 - total / 2.0
+        for k in kids:
+            kh = self._logic_bbox_height(k)
+            kcenter = child_top + kh / 2.0
+            self._layout_logic_subtree_balanced(k, root_w + _MIN_GAP, kcenter, 1)
+            child_top += kh + _MIN_GAP
 
     def _layout_column(self, kids, direction):
-        """一列一级节点：垂直堆叠（整体以根水平线为对称中心），子树沿 direction 展开。"""
-        roots = self._children.get(None, [])
-        root = roots[0] if roots else None
-        total = sum(self._subtree_height(k) for k in kids) * self._V_STEP
-        cy = -total / 2
+        """一列一级节点：从根顶边开始向下堆叠，子树沿 direction 展开。"""
+        root = self._children.get(None, [None])[0]
+        root_w = self._node_width(root) if root else _NODE_W
+        cy = 0.0
         for k in kids:
-            h = self._subtree_height(k) * self._V_STEP
-            x = direction * self._h_spacing(root, k) if root else direction * _NODE_W
-            self._layout_node_at(k, x, cy + h / 2, direction)
-            cy += h
+            kw = self._node_width(k)
+            kx = root_w + _MIN_GAP if direction > 0 else -kw - _MIN_GAP
+            kbox = self._layout_logic_subtree(k, kx, cy, direction)
+            cy = max(cy, kbox[3] + _MIN_GAP)
+
+    def _center_logic_branches(self):
+        """右向逻辑图整体围绕根节点水平中线上下对称。"""
+        root = self._children.get(None, [None])[0]
+        if root is None:
+            return
+        free_ids = {n["id"] for n in self._nodes.values() if n.get("free_float")}
+        locked = {root["id"]}
+        for fid in free_ids:
+            stack = [fid]
+            while stack:
+                cur = stack.pop()
+                locked.add(cur)
+                stack.extend(c["id"] for c in self._children.get(cur, []))
+        ys = [y for nid, (_x, y) in self._node_pos.items() if nid not in locked]
+        if not ys:
+            return
+        delta = -(min(ys) + max(ys)) / 2.0
+        for nid, (x, y) in list(self._node_pos.items()):
+            if nid not in locked:
+                self._node_pos[nid] = (x, y + delta)
 
     def _radial_layout(self):
-        """环形放射布局（XMind 经典）：根居中，一级主题按叶子数分配弧长环绕 360°，
-        子树沿径向逐层外扩。自由主题（free_float）及其子树保留原位不参与布局。"""
+        """环形放射布局：按子树角度需求自底向上分配不重叠的楔形扇区。
+
+        每个子树至少占用其自身节点矩形所需的角度宽度，并把子节点所需宽度
+        累加进父级扇区；一级半径通过二分找到能让全部子树放下且互不重叠的
+        最小值。自由主题保留原位不参与布局。
+        """
         import math
         roots = self._children.get(None, [])
         self._node_pos = {}
@@ -445,40 +613,187 @@ class QuestionTypeMindmapWindow(tk.Frame):
         kids = self._children.get(root["id"], [])
         if not kids:
             return
+        root_w = self._node_width(root)
+        ox, oy = root_w / 2.0, _NODE_H / 2.0
         free_ids = {n["id"] for n in self._nodes.values() if n.get("free_float")}
         for fid in free_ids:
             self._copy_free_subtree(fid)
         active = [k for k in kids if k["id"] not in free_ids]
         if not active:
             return
-        total = sum(self._leaf_count(k) for k in active)
-        angle = -90.0  # 从正上方顺时针环绕
 
-        def place(node, mid_angle, span, radius):
-            rad = math.radians(mid_angle)
-            self._node_pos[node["id"]] = (radius * math.cos(rad), radius * math.sin(rad))
+        def pair_delta(a, b, radius):
+            """两个同级节点中心至少需要错开的角度（保证水平/垂直留 20px）。"""
+            rx = (self._node_width(a) + self._node_width(b)) / 2.0 + _MIN_GAP
+            ry = _NODE_H + _MIN_GAP
+            ratio = min(1.0, math.hypot(rx, ry) / (2.0 * radius))
+            return 2.0 * math.asin(ratio)
+
+        def step_for(node):
+            subs = self._children.get(node["id"], [])
+            if not subs:
+                return self._RADIAL_STEP
+            return max(
+                self._RADIAL_STEP,
+                max(self._h_spacing(node, k) for k in subs),
+                _NODE_H + _MIN_GAP,
+            )
+
+        def required_half(node, siblings, radius):
+            """子树在指定半径下需要的角向半宽（rad）。"""
+            own = 0.0
+            if siblings:
+                own = max(pair_delta(node, s, radius) for s in siblings) / 2.0
+            subs = self._children.get(node["id"], [])
+            if node.get("collapsed") or not subs:
+                return own
+            child_radius = radius + step_for(node)
+            child_half = sum(
+                required_half(k, subs, child_radius) for k in subs
+            )
+            return max(own, child_half)
+
+        target_half = math.pi * self._RADIAL_FILL
+        lo = hi = max(self._RADIAL_R1, _NODE_H + _MIN_GAP)
+        while sum(required_half(k, active, hi) for k in active) > target_half:
+            hi *= 2.0
+        for _ in range(80):
+            mid = (lo + hi) / 2.0
+            if sum(required_half(k, active, mid) for k in active) <= target_half:
+                hi = mid
+            else:
+                lo = mid
+        r1 = hi
+
+        def place(node, mid_angle, half, radius):
+            rad = mid_angle
+            nw = self._node_width(node)
+            cx = ox + radius * math.cos(rad)
+            cy = oy + radius * math.sin(rad)
+            self._node_pos[node["id"]] = (cx - nw / 2.0, cy - _NODE_H / 2.0)
             if node.get("collapsed"):
                 return
             subs = self._children.get(node["id"], [])
             if not subs:
                 return
-            stotal = sum(self._leaf_count(k) for k in subs)
-            a = mid_angle - span / 2
-            sub_step = max(
-                self._RADIAL_STEP,
-                max((self._node_width(node) + self._node_width(k)) / 2 for k in subs) + _NODE_GAP,
-            )
-            for k in subs:
-                s = self._leaf_count(k) / stotal * span
-                place(k, a + s / 2, s, radius + sub_step)
-                a += s
+            step = step_for(node)
+            child_radius = radius + step
+            child_halfs = [
+                required_half(k, subs, child_radius) for k in subs
+            ]
+            child_total = sum(child_halfs)
+            while child_total > half + 1e-9 and step < 1e8:
+                step *= 2.0
+                child_radius = radius + step
+                child_halfs = [
+                    required_half(k, subs, child_radius) for k in subs
+                ]
+                child_total = sum(child_halfs)
+            gap = max(0.0, (half - child_total) / max(1, len(subs)))
+            start = mid_angle - (
+                child_total * 2.0 + gap * (len(subs) - 1)
+            ) / 2.0
+            for k, child_half in zip(subs, child_halfs):
+                place(k, start + child_half, child_half, child_radius)
+                start += child_half * 2.0 + gap
 
-        max_w = max((self._node_width(k) for k in active), default=_NODE_W)
-        r1 = max(self._RADIAL_R1, max_w + _NODE_GAP * 2)
+        total_half = sum(required_half(k, active, r1) for k in active)
+        gap = max(0.0, (target_half - total_half) / max(1, len(active)))
+        start = -math.pi / 2.0 - (
+            total_half * 2.0 + gap * (len(active) - 1)
+        ) / 2.0
         for k in active:
-            span = self._leaf_count(k) / total * 360.0
-            place(k, angle + span / 2, span, r1)
-            angle += span
+            half = required_half(k, active, r1)
+            place(k, start + half, half, r1)
+            start += half * 2.0 + gap
+
+    def _visible_rects(self):
+        """返回所有可见节点（不含折叠隐藏子树）的矩形（x, y, w, h）。"""
+        hidden = self._hidden_ids()
+        rects = {}
+        for nid, (x, y) in self._node_pos.items():
+            if nid in hidden:
+                continue
+            n = self._nodes.get(nid)
+            if not n:
+                continue
+            rects[nid] = (x, y, self._node_width(n), _NODE_H)
+        return rects
+
+    def _is_ancestor(self, ancestor_id, node_id):
+        cur = node_id
+        while cur is not None:
+            if cur == ancestor_id:
+                return True
+            node = self._nodes.get(cur)
+            cur = node.get("parent_id") if node else None
+        return False
+
+    def _movable_subtree(self, node_id, free_ids):
+        """返回可整体移动的子节点 id（跳过自由主题及其子树）。"""
+        out = []
+        stack = [node_id]
+        while stack:
+            cur = stack.pop()
+            if cur in free_ids:
+                continue
+            out.append(cur)
+            stack.extend(c["id"] for c in self._children.get(cur, []))
+        return out
+
+    def _resolve_collisions(self):
+        """碰撞检测与自动扩开：任意两个可见节点矩形之间至少保留 20px。
+
+        只处理在两个方向都间距不足的矩形对，按较小缺口方向把整棵子树
+        推离，最多迭代 3 轮；自由主题视为固定障碍。
+        """
+        free_ids = {n["id"] for n in self._nodes.values() if n.get("free_float")}
+        for _ in range(3):
+            rects = self._visible_rects()
+            ids = list(rects)
+            moved = False
+            for i, a in enumerate(ids):
+                for b in ids[i + 1:]:
+                    if self._is_ancestor(a, b) or self._is_ancestor(b, a):
+                        continue
+                    a_free, b_free = a in free_ids, b in free_ids
+                    if a_free and b_free:
+                        continue
+                    ax, ay, aw, ah = rects[a]
+                    bx, by, bw, bh = rects[b]
+                    acx, acy = ax + aw / 2.0, ay + ah / 2.0
+                    bcx, bcy = bx + bw / 2.0, by + bh / 2.0
+                    short_x = max(0.0, (aw + bw) / 2.0 + _MIN_GAP - abs(acx - bcx))
+                    short_y = max(0.0, (ah + bh) / 2.0 + _MIN_GAP - abs(acy - bcy))
+                    if short_x <= 1e-6 or short_y <= 1e-6:
+                        continue
+                    use_y = short_y <= short_x
+                    if use_y:
+                        amount = short_y
+                        sign = 1.0 if bcy > acy else -1.0
+                        dx, dy = 0.0, sign * amount
+                    else:
+                        amount = short_x
+                        sign = 1.0 if bcx > acx else -1.0
+                        dx, dy = sign * amount, 0.0
+                    if a_free:
+                        for nid in self._movable_subtree(b, free_ids):
+                            x, y = self._node_pos[nid]
+                            self._node_pos[nid] = (x + dx, y + dy)
+                    elif b_free:
+                        for nid in self._movable_subtree(a, free_ids):
+                            x, y = self._node_pos[nid]
+                            self._node_pos[nid] = (x - dx, y - dy)
+                    else:
+                        for nid in self._movable_subtree(a, free_ids):
+                            x, y = self._node_pos[nid]
+                            self._node_pos[nid] = (x - dx / 2.0, y - dy / 2.0)
+                        for nid in self._movable_subtree(b, free_ids):
+                            x, y = self._node_pos[nid]
+                            self._node_pos[nid] = (x + dx / 2.0, y + dy / 2.0)
+                    moved = True
+            if not moved:
+                break
 
     def _copy_free_subtree(self, node_id):
         """自由主题子树整体保留现有位置（缺省放原点）。"""
@@ -492,7 +807,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
 
     def _auto_layout_internal(self):
         """按当前布局模式（layout_type）重算全部节点位置。"""
-        layout = (self._map or {}).get("layout_type") or "radial"
+        layout = (self._map or {}).get("layout_type") or _DEFAULT_LAYOUT
         if layout == "columns":
             roots = self._children.get(None, [])
             self._node_pos = {}
@@ -503,9 +818,16 @@ class QuestionTypeMindmapWindow(tk.Frame):
             kids = self._children.get(root["id"], [])
             if not kids:
                 return
+            free_ids = {n["id"] for n in self._nodes.values() if n.get("free_float")}
+            for fid in free_ids:
+                self._copy_free_subtree(fid)
+            active = [k for k in kids if k["id"] not in free_ids]
             half = (len(kids) + 1) // 2
-            self._layout_column(kids[:half], -1)   # 左列
-            self._layout_column(kids[half:], 1)    # 右列
+            left = [k for k in active if k in kids[:half]]
+            right = [k for k in active if k in kids[half:]]
+            self._layout_column(left, -1)          # 左列
+            self._layout_column(right, 1)          # 右列
+            self._resolve_collisions()
         elif layout == "logic":
             roots = self._children.get(None, [])
             self._node_pos = {}
@@ -516,9 +838,16 @@ class QuestionTypeMindmapWindow(tk.Frame):
             kids = self._children.get(root["id"], [])
             if not kids:
                 return
-            self._layout_column(kids, 1)           # 全部向右
+            free_ids = {n["id"] for n in self._nodes.values() if n.get("free_float")}
+            for fid in free_ids:
+                self._copy_free_subtree(fid)
+            active = [k for k in kids if k["id"] not in free_ids]
+            self._layout_logic_branches(active)    # 右向逻辑图：分支统一向右
+            self._resolve_collisions()
+            self._center_logic_branches()          # 围绕根节点水平中线对称
         else:
             self._radial_layout()
+            self._resolve_collisions()
 
     def _center_view(self):
         """把当前布局整体居中到画布（scale=1）。"""
@@ -556,7 +885,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         self._collapse_buttons = {}
         scale, ox, oy = self._scale, self._off_x, self._off_y
         hidden = self._hidden_ids()
-        # 连线（分层贝塞尔曲线：越深越细、颜色继承父节点）
+        # 连线（圆角分支线：一级较粗、深层逐层变细/变淡，颜色继承父节点）
         for n in self._nodes.values():
             if n["parent_id"] is None or n["id"] in hidden:
                 continue
@@ -564,16 +893,22 @@ class QuestionTypeMindmapWindow(tk.Frame):
             if not parent or parent.get("collapsed"):
                 continue
             pw = self._node_width(parent)
+            nw = self._node_width(n)
             x1, y1 = world_to_screen(*self._node_pos.get(parent["id"], (0, 0)), scale, ox, oy)
             x2, y2 = world_to_screen(*self._node_pos.get(n["id"], (0, 0)), scale, ox, oy)
-            p0 = (x1 + pw * scale, y1 + _NODE_H * scale / 2)
-            p1 = (x2, y2 + _NODE_H * scale / 2)
-            pts = bezier_curve(p0, p1)
+            y_center = _NODE_H * scale / 2
+            if x2 + nw * scale < x1:
+                p0 = (x1, y1 + y_center)
+                p1 = (x2 + nw * scale, y2 + y_center)
+            else:
+                p0 = (x1 + pw * scale, y1 + y_center)
+                p1 = (x2, y2 + y_center)
+            pts = branch_curve(p0, p1)
             width, color = self._line_style(
                 self._depth_of.get(n["id"], 1), self._node_color(parent))
             if n["id"] == self._selected_id or parent["id"] == self._selected_id:
                 color, width = PALETTE["focus"], width + 1
-            self.canvas.create_line(pts, fill=color, width=width, capstyle=tk.ROUND, smooth=False)
+            self.canvas.create_line(pts, fill=color, width=width, capstyle=tk.ROUND, smooth=True)
         # 节点（隐藏折叠子树内的节点）
         for n in self._nodes.values():
             if n["id"] in hidden:
@@ -594,6 +929,20 @@ class QuestionTypeMindmapWindow(tk.Frame):
             return 2, lerp_color(color, PALETTE["bg"], 0.45)
         return 1.5, lerp_color(color, PALETTE["bg"], 0.25)
 
+    def _draw_node_icon(self, kind, cx, cy, r, fill, node_id):
+        if kind == "circle":
+            item = self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline="")
+        elif kind == "diamond":
+            item = self.canvas.create_polygon(
+                [cx, cy - r, cx + r, cy, cx, cy + r, cx - r, cy],
+                fill=fill, outline="")
+        elif kind == "square":
+            item = self.canvas.create_rectangle(cx - r, cy - r, cx + r, cy + r, fill=fill, outline="")
+        else:
+            item = self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=fill, outline="")
+        if item is not None:
+            self._node_items[item] = node_id
+
     def _draw_node(self, node, x, y):
         scale, ox, oy = self._scale, self._off_x, self._off_y
         color = self._node_color(node)
@@ -602,46 +951,95 @@ class QuestionTypeMindmapWindow(tk.Frame):
         sx, sy = world_to_screen(x, y, scale, ox, oy)
         is_root = node["parent_id"] is None
         selected = node["id"] == self._selected_id
-        fill = color if is_root else PALETTE["card"]
-        fg = "#FFFFFF" if is_root else PALETTE["text"]
-        outline = PALETTE["focus"] if selected else color
-        # 高错率预警：红描边
         stat = self._stats.get(node.get("topic_id")) if node.get("topic_id") else None
-        if stat:
-            total, wrong = stat
-            if total and wrong >= _WARN_MIN_WRONG and wrong / total >= _WARN_RATE:
-                outline = PALETTE["danger"]
+        warn = bool(stat and stat[0] and stat[1] >= _WARN_MIN_WRONG
+                    and stat[1] / stat[0] >= _WARN_RATE)
+        outline = PALETTE["focus"] if selected else (
+            PALETTE["danger"] if warn else color)
+        radius = 8 * scale
+
+        # 轻投影：仅普通节点使用，让卡片在画布上更有层次
+        if not is_root:
+            shadow = self.canvas.create_polygon(
+                round_rect_points(sx + 3 * scale, sy + 4 * scale, sw, sh, radius),
+                fill=lerp_color(PALETTE["border"], PALETTE["bg"], 0.55),
+                outline="", smooth=True)
+            self._node_items[shadow] = node["id"]
+
+        # 选中光晕：浅色外扩层 + 主色描边
+        if selected:
+            glow = self.canvas.create_polygon(
+                round_rect_points(sx - 2 * scale, sy - 2 * scale,
+                                  sw + 4 * scale, sh + 4 * scale, radius + 2 * scale),
+                fill=PALETTE["primary_faint"], outline="", smooth=True)
+            self._node_items[glow] = node["id"]
+
         rect = self.canvas.create_polygon(
-            round_rect_points(sx, sy, sw, sh, 10 * scale),
-            fill=fill, outline=outline, smooth=True,
-            width=3 if selected else 2)
-        label = " ".join(str(node["name"] or "").split())
-        text = self.canvas.create_text(sx + sw / 2, sy + sh / 2 - (8 if stat else 0),
-                                       text=label, fill=fg,
-                                       font=("Microsoft YaHei UI", 12, "bold"))
+            round_rect_points(sx, sy, sw, sh, radius),
+            fill=color if is_root else PALETTE["surface"],
+            outline=outline, smooth=True,
+            width=3 if selected else 1.5)
         self._node_items[rect] = node["id"]
-        self._node_items[text] = node["id"]
         self._node_rect[node["id"]] = rect
-        # 统计角标
+
+        if not is_root:
+            strip = self.canvas.create_rectangle(
+                sx + 2 * scale, sy + 6 * scale,
+                sx + 5 * scale, sy + sh - 6 * scale,
+                fill=color, outline="")
+            self._node_items[strip] = node["id"]
+
+        icon_kind = _NODE_ICON_KINDS.get(node["node_type"], "dot")
+        icon_fill = "#FFFFFF" if is_root else color
+        self._draw_node_icon(
+            icon_kind, sx + 15 * scale, sy + sh / 2,
+            _NODE_ICON_R * scale, icon_fill, node["id"])
+
+        label = " ".join(str(node["name"] or "").split())
+        text_y = sy + sh / 2 - (6 * scale if stat else 0)
+        text = self.canvas.create_text(
+            sx + _NODE_TEXT_LEFT * scale, text_y, text=label, fill=("#FFFFFF" if is_root else PALETTE["text"]),
+            font=("Microsoft YaHei UI", 12, "bold"), anchor="w")
+        self._node_items[text] = node["id"]
+
+        # 统计信息：节点底部居中
         if stat:
             total, wrong = stat
             badge = "{}题 · {}错".format(total, wrong)
-            bfg = PALETTE["danger"] if wrong and wrong / total >= _WARN_RATE else PALETTE["muted"]
-            btext = self.canvas.create_text(sx + sw / 2, sy + sh - 9, text=badge, fill=bfg,
-                                            font=("Microsoft YaHei UI", 9))
+            bfg = PALETTE["danger"] if warn else PALETTE["muted"]
+            btext = self.canvas.create_text(
+                sx + sw / 2.0, sy + sh - 11 * scale,
+                text=badge, fill=bfg, font=("Microsoft YaHei UI", 9), anchor="center")
             self._node_items[btext] = node["id"]
-        # 折叠/展开小按钮
+
+        # 折叠/展开小圆钮：圆形按钮 + 精简加减号
         if self._children.get(node["id"]):
-            mark = "+" if node.get("collapsed") else "-"
-            b = 13 * scale
-            btn = self.canvas.create_oval(sx + sw - b - 3, sy + 3, sx + sw - 3, sy + b + 3,
-                                          fill=PALETTE["surface"], outline=color)
-            lbl = self.canvas.create_text(sx + sw - b / 2 - 3, sy + b / 2 + 3, text=mark, fill=color,
-                                          font=("Microsoft YaHei UI", 9, "bold"))
+            b = 14 * scale
+            bx0, by0 = sx + sw - b - 3 * scale, sy + 3 * scale
+            btn = self.canvas.create_oval(
+                bx0, by0, bx0 + b, by0 + b,
+                fill=PALETTE["surface"], outline=color, width=1.2 * scale)
+            bcx, bcy = bx0 + b / 2, by0 + b / 2
+            arm = 5 * scale
+            if node.get("collapsed"):
+                hline = self.canvas.create_line(
+                    bcx - arm, bcy, bcx + arm, bcy,
+                    fill=color, width=1.2 * scale, capstyle=tk.ROUND)
+                vline = self.canvas.create_line(
+                    bcx, bcy - arm, bcx, bcy + arm,
+                    fill=color, width=1.2 * scale, capstyle=tk.ROUND)
+                self._node_items[hline] = node["id"]
+                self._node_items[vline] = node["id"]
+                self._collapse_buttons[hline] = node["id"]
+                self._collapse_buttons[vline] = node["id"]
+            else:
+                hline = self.canvas.create_line(
+                    bcx - arm, bcy, bcx + arm, bcy,
+                    fill=color, width=1.2 * scale, capstyle=tk.ROUND)
+                self._node_items[hline] = node["id"]
+                self._collapse_buttons[hline] = node["id"]
             self._node_items[btn] = node["id"]
-            self._node_items[lbl] = node["id"]
             self._collapse_buttons[btn] = node["id"]
-            self._collapse_buttons[lbl] = node["id"]
 
     def _find_node_by_event(self, event):
         item = self.canvas.find_withtag("current")
@@ -759,7 +1157,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
                 ty = self._node_pos[target_id][1]
                 if wy < ty - 10:                      # 明显在目标上方 -> 插其前
                     self.db.move_question_type(drag_id, target["parent_id"], index)
-                elif wy > ty + _NODE_H + _NODE_GAP:    # 明显在目标下方 -> 插其后
+                elif wy > ty + _NODE_H + _MIN_GAP:     # 明显在目标下方 -> 插其后
                     self.db.move_question_type(drag_id, target["parent_id"], index + 1)
                 else:                                 # 目标中心区域 -> 成为其子节点
                     self.db.move_question_type(drag_id, target_id, None)
@@ -861,7 +1259,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
             entry.destroy()
             if val and val != node["name"]:
                 fields = {"name": val}
-                if not node.get("node_width"):
+                if node.get("auto_width", 1):
                     fields["node_width"] = estimate_node_width(val)
                 self.db.update_question_type_full(node["id"], **fields)
                 node["name"] = val
@@ -994,7 +1392,7 @@ class QuestionTypeMindmapWindow(tk.Frame):
         if not m:
             return
         label = self.layout_var.get()
-        lt = next((k for k, v in _LAYOUT_LABELS.items() if v == label), "radial")
+        lt = next((k for k, v in _LAYOUT_LABELS.items() if v == label), _DEFAULT_LAYOUT)
         self.db.update_question_map(m["id"], layout_type=lt, layout_mode="auto")
         m["layout_type"] = lt  # 同步内存缓存（_current_map 读取它）
         m["layout_mode"] = "auto"
@@ -1207,9 +1605,16 @@ class QuestionTypeMindmapWindow(tk.Frame):
 
     # ---------- 操作 ----------
     def _add_map(self):
-        name = simpledialog.askstring("新增科目", "科目名称：", parent=self)
-        if not name:
+        values = ask_fields(
+            self, "新增科目", [
+                {"key": "name", "label": "科目名称", "required": True,
+                 "placeholder": "例如：资料分析"},
+            ],
+            subtitle="新增后将创建一张思维导图",
+        )
+        if not values:
             return
+        name = values["name"].strip()
         try:
             existing = next((r for r in self.db.root_topics() if r["name"] == name), None)
             if existing:
@@ -1277,7 +1682,9 @@ class QuestionTypeMindmapWindow(tk.Frame):
         if not node:
             return
         self.db.toggle_question_type_collapsed(node["id"])
-        node["collapsed"] = 0 if node.get("collapsed") else 1  # 仅改折叠态，不重排布局
+        node["collapsed"] = 0 if node.get("collapsed") else 1
+        if self._map.get("layout_mode") != "manual":
+            self._auto_layout_internal()
         self._draw()
         self._mark_dirty()
 
@@ -1287,6 +1694,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
         self.db.set_question_types_collapsed(self._map["id"], 0)
         for n in self._nodes.values():
             n["collapsed"] = 0
+        if self._map.get("layout_mode") != "manual":
+            self._auto_layout_internal()
         self._draw()
         self._mark_dirty()
 
@@ -1296,6 +1705,8 @@ class QuestionTypeMindmapWindow(tk.Frame):
         self.db.set_question_types_collapsed(self._map["id"], 1)
         for n in self._nodes.values():
             n["collapsed"] = 1
+        if self._map.get("layout_mode") != "manual":
+            self._auto_layout_internal()
         self._draw()
         self._mark_dirty()
 
@@ -1327,143 +1738,77 @@ class QuestionTypeMindmapWindow(tk.Frame):
         messagebox.showinfo("导出成功", "已导出：\n{}".format(path), parent=self)
 
 
-class NodeEditDialog(tk.Toplevel):
+class NodeEditDialog(FieldEditDialog):
+    """新增/编辑思维导图节点：统一字段表单 + 保留业务校验。"""
+
     def __init__(self, master, db, node=None, map_id=None, parent_id=None):
-        super().__init__(master)
         self.db = db
         self.node = node
         self.map_id = map_id or (node.get("map_id") if node else None)
-        self.parent_id = parent_id if parent_id is not None else (node.get("parent_id") if node else None)
-        self.title("编辑节点" if node else "新增节点")
-        self.geometry("640x640")
-        self.transient(master)
-        setup_styles(self)
-        self.configure(bg=PALETTE["bg"])
-        dialog_header(self, self.title(), "维护题型节点")
-        self._build_ui()
-        center_window(self)
-        self.grab_set()
-
-    def _build_ui(self):
-        P = PALETTE
-        body = tk.Frame(self, bg=P["bg"], padx=16, pady=12)
-        body.pack(fill="both", expand=True)
-
-        row = tk.Frame(body, bg=P["bg"])
-        row.pack(fill="x", pady=3)
-        tk.Label(row, text="名称：", bg=P["bg"]).pack(side="left")
-        self.name_var = tk.StringVar(value=self.node["name"] if self.node else "")
-        ttk.Entry(row, textvariable=self.name_var, width=28).pack(side="left", padx=(0, 10))
-        tk.Label(row, text="类型：", bg=P["bg"]).pack(side="left")
-        self.type_var = tk.StringVar(value=self.node["node_type"] if self.node else "type")
-        ttk.Combobox(row, textvariable=self.type_var, state="readonly", width=8,
-                     values=list(_NODE_TYPE_LABELS.keys())).pack(side="left")
-
-        row2 = tk.Frame(body, bg=P["bg"])
-        row2.pack(fill="x", pady=3)
-        tk.Label(row2, text="颜色：", bg=P["bg"]).pack(side="left")
-        self.color_var = tk.StringVar(value=self.node.get("color") if self.node else "")
-        self.color_btn = tk.Button(row2, text="选择颜色", command=self._pick_color,
-                                   bg=PALETTE["surface"], fg=PALETTE["text"])
-        self.color_btn.pack(side="left", padx=(0, 10))
-        tk.Label(row2, text="颜色值：", bg=P["bg"]).pack(side="left")
-        ttk.Entry(row2, textvariable=self.color_var, width=12).pack(side="left")
-
-        row_w = tk.Frame(body, bg=P["bg"])
-        row_w.pack(fill="x", pady=3)
-        self.auto_width_var = tk.BooleanVar(value=not (self.node and self.node.get("node_width")))
-        self.width_var = tk.DoubleVar(
-            value=(self.node.get("node_width") if self.node and self.node.get("node_width")
-                   else estimate_node_width(self.node["name"] if self.node else "")))
-        self.auto_width_cb = ttk.Checkbutton(
-            row_w, text="自动宽度（文字单行）", variable=self.auto_width_var,
-            command=self._sync_width_state)
-        self.auto_width_cb.pack(side="left")
-        tk.Label(row_w, text="宽度：", bg=P["bg"]).pack(side="left", padx=(12, 0))
-        self.width_spin = ttk.Spinbox(row_w, from_=120, to=1200, increment=10,
-                                      textvariable=self.width_var, width=8)
-        self.width_spin.pack(side="left")
-        tk.Label(row_w, text="px", bg=P["bg"]).pack(side="left")
-        self.name_var.trace_add("write", lambda *a: self._auto_fit_width())
-        self._sync_width_state()
-
-        row3 = tk.Frame(body, bg=P["bg"])
-        row3.pack(fill="x", pady=3)
-        tk.Label(row3, text="关联知识点：", bg=P["bg"]).pack(side="left")
-        self.topic_var = tk.StringVar()
-        self.topic_box = ttk.Combobox(row3, textvariable=self.topic_var, state="readonly", width=32)
-        self.topic_box.pack(side="left", padx=(0, 10))
-        tk.Label(row3, text="（关联后节点显示题目统计）", bg=P["bg"],
-                 fg=P["muted"], font=("Microsoft YaHei UI", 9)).pack(side="left")
-        self._load_topics()
-
-        self.fields = {}
-        for key, label, height in (
-            ("recognition", "识别方法", 4),
-            ("approach", "解题思路", 5),
-            ("method", "解题方法", 5),
-            ("remark", "备注", 3),
-        ):
-            f = tk.Frame(body, bg=P["bg"])
-            f.pack(fill="both", expand=True, pady=(4, 0))
-            tk.Label(f, text=label, bg=P["bg"], fg=P["text"],
-                     font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
-            txt = tk.Text(f, height=height, wrap="word", font=("Microsoft YaHei UI", 11),
-                          bg=P["input"], fg=P["text"], relief="flat",
-                          highlightthickness=1, highlightbackground=P["border"])
-            if self.node:
-                txt.insert("1.0", self.node.get(key) or "")
-            txt.pack(fill="both", expand=True, pady=(2, 0))
-            self.fields[key] = txt
-
-        btns = tk.Frame(self, bg=P["bg"], padx=16, pady=10)
-        btns.pack(fill="x")
-        ttk.Button(btns, text="取消", command=self.destroy).pack(side="right")
-        ttk.Button(btns, text="保存", style="Accent.TButton", command=self._save).pack(side="right", padx=8)
-
-    def _load_topics(self):
-        topics = self.db.list_topics()
-        paths = self.db.topic_paths([t["id"] for t in topics])
+        self.parent_id = parent_id if parent_id is not None else (
+            node.get("parent_id") if node else None
+        )
+        topics = db.list_topics()
+        paths = db.topic_paths([t["id"] for t in topics])
         self._topic_map = {paths[t["id"]]: t["id"] for t in topics}
-        current = "（不关联）"
-        if self.node and self.node.get("topic_id"):
-            current = paths.get(self.node["topic_id"], "（不关联）")
-        self.topic_box.configure(values=["（不关联）"] + sorted(paths.values()))
-        self.topic_var.set(current)
+        current_topic = "（不关联）"
+        if node and node.get("topic_id"):
+            current_topic = paths.get(node["topic_id"], "（不关联）")
+        name = node["name"] if node else ""
+        auto_width = bool(node.get("auto_width", 1)) if node else True
+        width = (node.get("node_width") if node and not auto_width and node.get("node_width")
+                 else int(estimate_node_width(name)))
+        fields = [
+            {"key": "name", "label": "节点名称", "value": name,
+             "required": True, "placeholder": "例如：增长量计算"},
+            {"key": "node_type", "label": "节点类型", "type": "choice",
+             "required": True, "choices": list(_NODE_TYPE_LABELS.keys()),
+             "value": node["node_type"] if node else "type"},
+            {"key": "auto_width", "label": "节点宽度", "type": "bool",
+             "value": auto_width, "check_text": "自动宽度（文字单行）"},
+            {"key": "node_width", "label": "宽度", "type": "integer",
+             "value": int(width), "min": int(_MIN_NODE_W), "max": 1200},
+            {"key": "color", "label": "节点颜色", "type": "color",
+             "value": node.get("color") if node else ""},
+            {"key": "topic", "label": "关联知识点", "type": "choice",
+             "choices": ["（不关联）"] + sorted(paths.values()),
+             "value": current_topic},
+            {"key": "recognition", "label": "识别方法", "type": "multiline",
+             "height": 3, "value": node.get("recognition") if node else ""},
+            {"key": "approach", "label": "解题思路", "type": "multiline",
+             "height": 4, "value": node.get("approach") if node else ""},
+            {"key": "method", "label": "解题方法", "type": "multiline",
+             "height": 4, "value": node.get("method") if node else ""},
+            {"key": "remark", "label": "备注", "type": "multiline",
+             "height": 3, "value": node.get("remark") if node else ""},
+        ]
+        super().__init__(
+            master, "编辑节点" if node else "新增节点", fields,
+            subtitle="维护题型节点",
+        )
 
-    def _pick_color(self):
-        color = colorchooser.askcolor(color=self.color_var.get() or "#4A7BE0", parent=self)[1]
-        if color:
-            self.color_var.set(color)
-
-    def _sync_width_state(self):
-        if self.auto_width_var.get():
-            self._auto_fit_width()
-            self.width_spin.configure(state="disabled")
-        else:
-            self.width_spin.configure(state="normal")
-
-    def _auto_fit_width(self):
-        if self.auto_width_var.get():
-            self.width_var.set(int(estimate_node_width(self.name_var.get())))
-
-    def _save(self):
-        name = self.name_var.get().strip()
-        if not name:
-            messagebox.showwarning("提示", "名称不能为空", parent=self)
+    def _save(self, event=None):
+        values = self._collect_values()
+        errors = self._validate_values(values)
+        if errors:
+            self._show_errors(errors)
             return
-        topic_label = self.topic_var.get()
-        node_width = self.width_var.get()
+        name = values["name"].strip()
+        node_width = (int(estimate_node_width(name)) if values["auto_width"]
+                      else values["node_width"])
+        topic_label = values["topic"]
         data = {
             "name": name,
-            "node_type": self.type_var.get(),
-            "color": self.color_var.get().strip(),
+            "node_type": values["node_type"],
+            "color": values["color"],
             "node_width": node_width,
-            "recognition": self.fields["recognition"].get("1.0", "end").strip(),
-            "approach": self.fields["approach"].get("1.0", "end").strip(),
-            "method": self.fields["method"].get("1.0", "end").strip(),
-            "remark": self.fields["remark"].get("1.0", "end").strip(),
-            "topic_id": self._topic_map.get(topic_label) if topic_label != "（不关联）" else None,
+            "auto_width": 1 if values["auto_width"] else 0,
+            "recognition": values["recognition"],
+            "approach": values["approach"],
+            "method": values["method"],
+            "remark": values["remark"],
+            "topic_id": (self._topic_map.get(topic_label)
+                         if topic_label != "（不关联）" else None),
         }
         if self.node:
             data["parent_id"] = self.node.get("parent_id")
@@ -1472,4 +1817,5 @@ class NodeEditDialog(tk.Toplevel):
             data["map_id"] = self.map_id
             data["parent_id"] = self.parent_id
             self.db.add_question_type_full(**data)
+        self.result = data
         self.destroy()

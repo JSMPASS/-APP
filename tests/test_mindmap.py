@@ -14,7 +14,7 @@ from habit_checkin.ui.question_type_mindmap_window import (
     QuestionTypeMindmapWindow,
     _NODE_W,
     _NODE_H,
-    _NODE_GAP,
+    _MIN_GAP,
     estimate_node_width,
     bezier_curve,
     round_rect_points,
@@ -120,24 +120,57 @@ class TestLayout(unittest.TestCase):
         w._auto_layout_internal()
         return w, w._node_pos
 
+    def _window_from_nodes(self, nodes, layout_type):
+        w = QuestionTypeMindmapWindow.__new__(QuestionTypeMindmapWindow)
+        w._nodes = {n["id"]: n for n in nodes}
+        w._children = {}
+        for n in nodes:
+            w._children.setdefault(n["parent_id"], []).append(n)
+        for lst in w._children.values():
+            lst.sort(key=lambda x: (x.get("sort_order") or 0, x["id"]))
+        w._map = {"layout_type": layout_type}
+        w._node_pos = {}
+        w._auto_layout_internal()
+        return w
+
+    def _assert_min_gap(self, w):
+        rects = w._visible_rects()
+        ids = list(rects)
+        for i, a in enumerate(ids):
+            for b in ids[i + 1:]:
+                ax, ay, aw, ah = rects[a]
+                bx, by, bw, bh = rects[b]
+                acx, acy = ax + aw / 2.0, ay + ah / 2.0
+                bcx, bcy = bx + bw / 2.0, by + bh / 2.0
+                h_ok = abs(acx - bcx) >= (aw + bw) / 2.0 + _MIN_GAP - 1e-6
+                v_ok = abs(acy - bcy) >= (ah + bh) / 2.0 + _MIN_GAP - 1e-6
+                self.assertTrue(
+                    h_ok or v_ok,
+                    "layout={} nodes {} and {} overlap".format(
+                        w._map.get("layout_type"), a, b),
+                )
+
     def test_root_centered(self):
-        for layout in ("radial", "columns"):
+        for layout in ("radial", "columns", "logic"):
             _, pos = self._layout(layout)
             root = self.children[None][0]
             self.assertEqual(pos[root["id"]], (0.0, 0.0))
 
     def test_radial_level1_around_center(self):
-        """放射布局：一级节点分布在根周围同一半径，覆盖超过 2/3 圆周。"""
+        """放射布局：一级节点分布在根中心周围同一半径，覆盖超过 2/3 圆周。"""
         import math
         w, pos = self._layout("radial")
         root = self.children[None][0]
+        root_w = w._node_width(root)
         kids = self.children[root["id"]]
         angles = []
         for k in kids:
             x, y = pos[k["id"]]
-            r = math.hypot(x, y)
-            self.assertAlmostEqual(r, 260.0, delta=1e-6)
-            angles.append(math.degrees(math.atan2(y, x)))
+            cx = x + w._node_width(k) / 2.0 - root_w / 2.0
+            cy = y + _NODE_H / 2.0 - _NODE_H / 2.0
+            r = math.hypot(cx, cy)
+            self.assertGreaterEqual(r, root_w / 2.0 + w._node_width(k) / 2.0 + _MIN_GAP)
+            angles.append(math.degrees(math.atan2(cy, cx)))
         angles.sort()
         gaps = []
         for i in range(len(angles)):
@@ -161,24 +194,18 @@ class TestLayout(unittest.TestCase):
         self.assertEqual((x, y), (1234.0, -567.0))
 
     def test_columns_layout_kept(self):
-        """两翼对称布局保留：前一半左列、后一半右列，间距按节点宽度计算。"""
+        """两翼对称布局保留：前一半左列、后一半右列，父子边距至少 20px。"""
         w, pos = self._layout("columns")
         root = self.children[None][0]
         kids = self.children[root["id"]]
         half = (len(kids) + 1) // 2
-        root_w = w._node_width(root)
         for k in kids[:half]:
-            self.assertAlmostEqual(
-                pos[k["id"]][0],
-                -(root_w + w._node_width(k)) / 2 - _NODE_GAP,
-                places=6,
-            )
+            kx = pos[k["id"]][0]
+            self.assertLess(kx, 0)
+            self.assertGreaterEqual(-kx - w._node_width(k), _MIN_GAP)
         for k in kids[half:]:
-            self.assertAlmostEqual(
-                pos[k["id"]][0],
-                (root_w + w._node_width(k)) / 2 + _NODE_GAP,
-                places=6,
-            )
+            self.assertGreaterEqual(
+                pos[k["id"]][0] - w._node_width(root), _MIN_GAP)
 
     def test_level1_symmetric_left_right(self):
         """两翼布局下：一级子节点前一半左列、后一半右列，垂直错开。"""
@@ -196,26 +223,136 @@ class TestLayout(unittest.TestCase):
         self.assertEqual(len(set(left_ys)), len(left))
         self.assertEqual(len(set(right_ys)), len(right))
 
-    def test_auto_layout_min_gap(self):
-        """自动布局时父子水平间距与兄弟垂直间距均至少保留 10px。"""
-        w, pos = self._layout("columns")
+    def test_all_layouts_keep_min_gap(self):
+        """三种自动布局下，任意两个可见节点矩形至少在一个方向保留 20px。"""
+        for layout in ("radial", "columns", "logic"):
+            w, _ = self._layout(layout)
+            self._assert_min_gap(w)
 
-        def check(parent_id):
-            for k in w._children.get(parent_id, []):
-                if parent_id is not None:
-                    px = pos[parent_id][0]
-                    cx = pos[k["id"]][0]
-                    h_gap = abs(cx - px) - (w._node_width(w._nodes[parent_id]) + w._node_width(k)) / 2
-                    self.assertGreaterEqual(h_gap, _NODE_GAP - 1e-6)
-                check(k["id"])
+    def test_add_many_siblings_clear_in_all_layouts(self):
+        """真实新增 8 个同级节点后，三种自动布局都不重叠且间距至少 20px。"""
+        m = next(
+            x for x in self.db.list_question_maps()
+            if x["subject_name"] == "行测"
+        )
+        root = next(
+            n for n in self.db.question_types_by_map(m["id"])
+            if n["parent_id"] is None
+        )
+        for i in range(8):
+            self.db.add_question_type_full(
+                "新增节点{}".format(i + 1),
+                parent_id=root["id"],
+                map_id=m["id"],
+                node_type="type",
+            )
+        nodes = self.db.question_types_by_map(m["id"])
+        for layout in ("radial", "columns", "logic"):
+            w = self._window_from_nodes(nodes, layout)
+            self._assert_min_gap(w)
 
-            siblings = w._children.get(parent_id, [])
-            for prev, nxt in zip(siblings, siblings[1:]):
-                if abs(pos[prev["id"]][0] - pos[nxt["id"]][0]) < 1e-6:
-                    gap = pos[nxt["id"]][1] - pos[prev["id"]][1] - _NODE_H
-                    self.assertGreaterEqual(gap, _NODE_GAP - 1e-6)
+    def test_new_sibling_auto_expands(self):
+        """右向逻辑图新增多个同级节点后全部向右展开且间距自动扩开。"""
+        w = QuestionTypeMindmapWindow.__new__(QuestionTypeMindmapWindow)
+        root = {"id": 1, "name": "根", "parent_id": None, "collapsed": 0, "node_type": "root"}
+        kids = [{"id": i, "name": "节点{}".format(i), "parent_id": 1,
+                 "collapsed": 0, "node_type": "type"} for i in range(2, 11)]
+        w._children = {None: [root], 1: kids}
+        w._nodes = {1: root}
+        w._nodes.update({k["id"]: k for k in kids})
+        w._map = {"layout_type": "logic"}
+        w._node_pos = {}
+        w._auto_layout_internal()
+        rects = w._visible_rects()
+        root_w = w._node_width(root)
+        for n in kids:
+            x, y, nw, _ = rects[n["id"]]
+            self.assertGreaterEqual(x - root_w, _MIN_GAP - 1e-6)
+        for i, a in enumerate(kids):
+            for b in kids[i + 1:]:
+                ay = rects[a["id"]][1]
+                by = rects[b["id"]][1]
+                self.assertGreaterEqual(by - (ay + _NODE_H), _MIN_GAP)
+        child_tops = [rects[n["id"]][1] for n in kids]
+        center = (min(child_tops) + max(child_tops) + _NODE_H) / 2.0
+        self.assertAlmostEqual(center, _NODE_H / 2.0, places=6)
 
-        check(None)
+    def test_logic_symmetric_around_root_center(self):
+        """右向逻辑图整体围绕根节点水平中线上下对称。"""
+        w, pos = self._layout("logic")
+        root = self.children[None][0]
+        rects = w._visible_rects()
+        non_root_rects = [
+            (r[1], r[1] + _NODE_H) for nid, r in rects.items()
+            if nid != root["id"]
+        ]
+        top = min(r[0] for r in non_root_rects)
+        bottom = max(r[1] for r in non_root_rects)
+        self.assertAlmostEqual((top + bottom) / 2.0, _NODE_H / 2.0, places=6)
+        kids = self.children[root["id"]]
+        root_w = w._node_width(root)
+        for k in kids:
+            self.assertGreaterEqual(
+                pos[k["id"]][0] - root_w, _MIN_GAP - 1e-6)
+
+    def test_logic_parent_centered_and_root_symmetric(self):
+        """父节点落在子分支组垂直中线上，整体仍围绕根节点中线对称。"""
+        root = {"id": 1, "name": "根", "parent_id": None, "collapsed": 0,
+                "node_type": "root"}
+        a = {"id": 2, "name": "A", "parent_id": 1, "collapsed": 0,
+             "node_type": "category"}
+        b = {"id": 3, "name": "B", "parent_id": 1, "collapsed": 0,
+             "node_type": "category"}
+        leaves = [
+            {"id": i, "name": "N{}".format(i), "parent_id": pid,
+             "collapsed": 0, "node_type": "type"}
+            for pid, ids in ((2, (4, 5)), (3, (6, 7, 8)))
+            for i in ids
+        ]
+        nodes = [root, a, b] + leaves
+        w = self._window_from_nodes(nodes, "logic")
+        rects = w._visible_rects()
+        for parent_id, child_ids in ((2, (4, 5)), (3, (6, 7, 8))):
+            pnode = next(n for n in nodes if n["id"] == parent_id)
+            py = rects[parent_id][1] + _NODE_H / 2.0
+            tops = [rects[cid][1] for cid in child_ids]
+            group_center = (min(tops) + max(tops) + _NODE_H) / 2.0
+            self.assertAlmostEqual(group_center, py, places=6)
+        non_root = [r for nid, r in rects.items() if nid != root["id"]]
+        top = min(r[1] for r in non_root)
+        bottom = max(r[1] + _NODE_H for r in non_root)
+        self.assertAlmostEqual((top + bottom) / 2.0, _NODE_H / 2.0, places=6)
+        self._assert_min_gap(w)
+
+    def test_logic_parent_centered_recursive(self):
+        """右向逻辑图逐层居中：多级父子节点都对齐各自子分支组中线。"""
+        root = {"id": 1, "name": "根", "parent_id": None, "collapsed": 0,
+                "node_type": "root"}
+        a = {"id": 2, "name": "A", "parent_id": 1, "collapsed": 0,
+             "node_type": "category"}
+        b = {"id": 3, "name": "B", "parent_id": 2, "collapsed": 0,
+             "node_type": "category"}
+        leaves = [
+            {"id": i, "name": "L{}".format(i), "parent_id": 3,
+             "collapsed": 0, "node_type": "type"}
+            for i in (4, 5)
+        ]
+        c = {"id": 6, "name": "C", "parent_id": 1, "collapsed": 0,
+             "node_type": "type"}
+        nodes = [root, a, b, c] + leaves
+        w = self._window_from_nodes(nodes, "logic")
+        rects = w._visible_rects()
+        leaves_center = (
+            rects[4][1] + rects[5][1] + _NODE_H
+        ) / 2.0
+        for pid in (2, 3):
+            py = rects[pid][1] + _NODE_H / 2.0
+            self.assertAlmostEqual(leaves_center, py, places=6)
+        non_root = [r for nid, r in rects.items() if nid != root["id"]]
+        top = min(r[1] for r in non_root)
+        bottom = max(r[1] + _NODE_H for r in non_root)
+        self.assertAlmostEqual((top + bottom) / 2.0, _NODE_H / 2.0, places=6)
+        self._assert_min_gap(w)
 
     def test_child_starts_at_parent_level(self):
         """子节点从父节点水平线向下排列：首个子节点与父节点同水平。"""
@@ -271,12 +408,22 @@ class TestLayout(unittest.TestCase):
         self.assertIsNone(vx2)
 
     def test_estimate_node_width_single_line(self):
-        """节点宽度按单行文字自动估算，长名称比短名称更宽。"""
+        """自动宽度随名称长短变化，手动宽度保留用户设定值。"""
         short = estimate_node_width("资料分析")
         long = estimate_node_width("逻辑填空（选词填空）")
         self.assertGreater(long, short)
         self.assertGreaterEqual(short, 120.0)
-        node = {"name": "短", "node_width": 300.0}
+        auto = {"name": "短", "node_width": 300.0, "auto_width": 1}
+        self.assertEqual(
+            QuestionTypeMindmapWindow._node_width(auto),
+            estimate_node_width("短"),
+        )
+        auto["name"] = "这是一个更长的节点名称"
+        self.assertGreater(
+            QuestionTypeMindmapWindow._node_width(auto),
+            estimate_node_width("短"),
+        )
+        node = {"name": "短", "node_width": 300.0, "auto_width": 0}
         self.assertEqual(QuestionTypeMindmapWindow._node_width(node), 300.0)
 
 

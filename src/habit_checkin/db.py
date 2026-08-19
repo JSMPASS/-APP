@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS question_types (
     remark TEXT NOT NULL DEFAULT '',
     color TEXT NOT NULL DEFAULT '',
     node_width REAL NOT NULL DEFAULT 0,
+    auto_width INTEGER NOT NULL DEFAULT 1,
     pos_x REAL NOT NULL DEFAULT 0,
     pos_y REAL NOT NULL DEFAULT 0,
     collapsed INTEGER NOT NULL DEFAULT 0,
@@ -121,6 +122,7 @@ CREATE TABLE IF NOT EXISTS question_maps (
     topic_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
     color TEXT NOT NULL DEFAULT '#4A7BE0',
     layout_mode TEXT NOT NULL DEFAULT 'auto',
+    layout_type TEXT NOT NULL DEFAULT 'logic',
     view_scale REAL NOT NULL DEFAULT 1.0,
     view_offset_x REAL NOT NULL DEFAULT 0,
     view_offset_y REAL NOT NULL DEFAULT 0,
@@ -147,6 +149,14 @@ METHOD_TOPIC_NAMES = {
     "知识学习",
     "实践",
 }
+
+# 计划生成依赖的具体做法节点：按科目管理中的原层级补回（根 → 叶）
+METHOD_TOPIC_PATHS = [
+    ("行测", "自由补弱"),
+    ("行测", "行测套题"),
+    ("行测", "全模块小测"),
+    ("申论", "申论套题"),
+]
 
 SEED_TOPICS = [
     ("行测", [
@@ -184,6 +194,7 @@ class Database:
         self._seed_topics()
         self._migrate_remove_cuoti_topic()
         self._migrate_topic_kinds()
+        self._migrate_ensure_method_topics()
         self._seed_metrics()
         self._seed_question_types()
 
@@ -210,6 +221,8 @@ class Database:
          "ALTER TABLE question_types ADD COLUMN topic_id INTEGER"),
         ("question_types", "node_width",
          "ALTER TABLE question_types ADD COLUMN node_width REAL NOT NULL DEFAULT 0"),
+        ("question_types", "auto_width",
+         "ALTER TABLE question_types ADD COLUMN auto_width INTEGER NOT NULL DEFAULT 1"),
         ("topics", "kind",
          "ALTER TABLE topics ADD COLUMN kind TEXT NOT NULL DEFAULT 'category'"),
         ("question_maps", "topic_id",
@@ -223,7 +236,7 @@ class Database:
         ("question_maps", "view_offset_y",
          "ALTER TABLE question_maps ADD COLUMN view_offset_y REAL NOT NULL DEFAULT 0"),
         ("question_maps", "layout_type",
-         "ALTER TABLE question_maps ADD COLUMN layout_type TEXT NOT NULL DEFAULT 'radial'"),
+         "ALTER TABLE question_maps ADD COLUMN layout_type TEXT NOT NULL DEFAULT 'logic'"),
         ("question_types", "free_float",
          "ALTER TABLE question_types ADD COLUMN free_float INTEGER NOT NULL DEFAULT 0"),
     ]
@@ -292,6 +305,34 @@ class Database:
             "UPDATE topics SET kind='method' WHERE name IN ({})".format(placeholders),
             tuple(METHOD_TOPIC_NAMES),
         )
+        self.conn.commit()
+
+    def _migrate_ensure_method_topics(self):
+        """把计划生成依赖的具体做法节点补回科目管理（幂等，不重建已删除的科目根）。"""
+        for root_name, method_name in METHOD_TOPIC_PATHS:
+            root = self.conn.execute(
+                "SELECT id, disabled FROM topics WHERE parent_id IS NULL AND name=? "
+                "ORDER BY disabled ASC, sort_order, id LIMIT 1",
+                (root_name,),
+            ).fetchone()
+            if not root:
+                continue
+            existing = self.conn.execute(
+                "SELECT id FROM topics WHERE parent_id=? AND name=? ORDER BY id LIMIT 1",
+                (root["id"], method_name),
+            ).fetchone()
+            if existing:
+                self.conn.execute("UPDATE topics SET kind='method' WHERE id=?", (existing["id"],))
+                continue
+            max_order = self.conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) AS m FROM topics WHERE parent_id=?",
+                (root["id"],),
+            ).fetchone()["m"]
+            self.conn.execute(
+                "INSERT INTO topics(parent_id, name, kind, is_preset, disabled, sort_order) "
+                "VALUES (?,?,?,?,?,?)",
+                (root["id"], method_name, "method", 0, root["disabled"], max_order + 1),
+            )
         self.conn.commit()
 
 
@@ -844,7 +885,11 @@ class Database:
         return items
 
     def get_plan_item(self, item_id):
-        row = self.conn.execute("SELECT * FROM plan_items WHERE id=?", (item_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT pi.*, p.date AS plan_date FROM plan_items pi "
+            "JOIN plans p ON p.id = pi.plan_id WHERE pi.id = ?",
+            (item_id,),
+        ).fetchone()
         if not row:
             return None
         d = dict(row)
@@ -1382,9 +1427,9 @@ class Database:
             raise ValueError("科目名称不能为空")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cur = self.conn.execute(
-            "INSERT INTO question_maps(subject_name, topic_id, color, layout_mode, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?)",
-            (subject_name, topic_id, color, layout_mode, now, now),
+            "INSERT INTO question_maps(subject_name, topic_id, color, layout_mode, layout_type, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (subject_name, topic_id, color, layout_mode, "logic", now, now),
         )
         map_id = cur.lastrowid
         # 自动创建该科目的根节点
@@ -1507,7 +1552,7 @@ class Database:
 
     def add_question_type_full(self, name, parent_id=None, node_type="type", map_id=None,
                                recognition="", approach="", method="", remark="",
-                               color="", node_width=0, pos_x=0, pos_y=0, collapsed=0,
+                               color="", node_width=0, auto_width=1, pos_x=0, pos_y=0, collapsed=0,
                                topic_id=None):
         """新增题型节点（支持思维导图完整字段）。"""
         name = name.strip()
@@ -1525,10 +1570,10 @@ class Database:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cur = self.conn.execute(
             "INSERT INTO question_types(parent_id, map_id, name, node_type, recognition, approach, method, "
-            "remark, color, node_width, pos_x, pos_y, collapsed, topic_id, sort_order, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "remark, color, node_width, auto_width, pos_x, pos_y, collapsed, topic_id, sort_order, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (parent_id, map_id, name, node_type, recognition or "", approach or "", method or "",
-             remark or "", color or "", float(node_width or 0), float(pos_x or 0),
+             remark or "", color or "", float(node_width or 0), 1 if auto_width else 0, float(pos_x or 0),
              float(pos_y or 0), 1 if collapsed else 0, topic_id, max_order + 1, now, now),
         )
         self.conn.commit()
@@ -1536,7 +1581,7 @@ class Database:
 
     def update_question_type_full(self, qtype_id, **fields):
         allowed = {"name", "parent_id", "node_type", "recognition", "approach", "method",
-                   "remark", "color", "node_width", "pos_x", "pos_y", "collapsed", "map_id", "topic_id",
+                   "remark", "color", "node_width", "auto_width", "pos_x", "pos_y", "collapsed", "map_id", "topic_id",
                    "free_float", "sort_order"}
         if "parent_id" in fields:
             node = self.get_question_type(qtype_id)

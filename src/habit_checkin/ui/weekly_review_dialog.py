@@ -8,6 +8,7 @@ from tkinter import messagebox, ttk
 
 from habit_checkin.ui.animate import fade_in
 from habit_checkin.ui.common import center_window, setup_styles
+from habit_checkin.ui.field_edit_dialog import FieldTextArea
 from habit_checkin.ui.theme import PALETTE, dialog_header
 
 
@@ -57,9 +58,7 @@ class WeeklyReviewDialog(tk.Toplevel):
             box.pack(fill="both", expand=True, pady=(0, 8))
             tk.Label(box, text=label, bg=P["surface"], fg=P["text"],
                      font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-            txt = tk.Text(box, height=height, wrap="word", font=("Microsoft YaHei UI", 13),
-                          bg=P["input"], fg=P["text"], relief="flat", highlightthickness=1,
-                          highlightbackground=P["border"], highlightcolor=P["primary"])
+            txt = FieldTextArea(box, height=height)
             txt.pack(fill="both", expand=True, pady=(4, 0))
             setattr(self, key, txt)
 

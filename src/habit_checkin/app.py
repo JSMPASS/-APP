@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -14,6 +15,9 @@ def get_base_dir():
     """应用根目录：打包态为 exe 所在目录，开发态为仓库根目录。"""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
+    override = os.environ.get("HABIT_ROOT")
+    if override:
+        return Path(override).resolve()
     return Path(__file__).resolve().parent.parent.parent
 
 
@@ -33,6 +37,27 @@ BASE_DIR = get_base_dir()
 DATA_DIR = BASE_DIR / "data"
 IMAGES_DIR = DATA_DIR / "images"
 DB_PATH = DATA_DIR / "app.db"
+
+
+def _ensure_tcl_library():
+    """为缺少自带 Tcl 脚本目录的 Windows Python 补上本地 Tcl/Tk 库路径。"""
+    if not sys.platform.startswith("win"):
+        return
+    candidates = [
+        BASE_DIR / "runtime" / "tcl" / "tcl8.6",
+        Path(__file__).resolve().parent / "resources" / "tcl" / "tcl8.6",
+    ]
+    for tcl_dir in candidates:
+        if not (tcl_dir / "init.tcl").is_file():
+            continue
+        os.environ.setdefault("TCL_LIBRARY", str(tcl_dir))
+        tk_dir = tcl_dir.parent / "tk8.6"
+        if (tk_dir / "tk.tcl").is_file():
+            os.environ.setdefault("TK_LIBRARY", str(tk_dir))
+        break
+
+
+_ensure_tcl_library()
 
 
 def setup_logging():
