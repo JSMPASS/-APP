@@ -17,6 +17,7 @@ from habit_checkin.ui.animate import count_up, lerp_color, smooth_progress, toas
 from habit_checkin.ui.checkin_dialog import CheckinDialog
 from habit_checkin.ui.close_dialog import CloseChoiceDialog
 from habit_checkin.ui.progress_ring import ProgressRing
+from habit_checkin.ui.richtext import to_plain
 from habit_checkin.ui.theme import PALETTE, apply_theme, card, dialog_header, hover_button, stat_card
 from habit_checkin.ui.theme_menu import ThemeMenu
 
@@ -28,7 +29,8 @@ class SidebarApp(tk.Tk):
         ("today", "首页"),
         ("study", "备考进度"),
         ("bank", "题库"),
-        ("types", "题型"),
+        ("types", "题型思维导图"),
+        ("knowledge", "知识库"),
         ("reflection", "练习复盘"),
         ("progress", "总体进度"),
         ("history", "历史记录"),
@@ -38,6 +40,8 @@ class SidebarApp(tk.Tk):
     def __init__(self, db):
         super().__init__()
         self.db = db
+        from habit_checkin.services.ocr import apply_model_dir_from_setting
+        apply_model_dir_from_setting(self.db)
         self.title("习惯打卡")
         self.geometry("1672x1050")
         self.minsize(1320, 820)
@@ -46,6 +50,7 @@ class SidebarApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close_choice)
         self._pages = {}
         self._nav_buttons = {}
+        self._page_revisions = {}
         self._current = None
         self._build_sidebar()
         self._build_content()
@@ -134,7 +139,13 @@ class SidebarApp(tk.Tk):
         # 页面 pack 进内容区容器（而非根窗口），否则内容区只占极小宽度、页面溢出到右侧
         page.pack(in_=self.content, fill="both", expand=True)
         if hasattr(page, "refresh"):
-            page.refresh()
+            force = bool(getattr(page, "_force_refresh", False))
+            page._force_refresh = False
+            last = self._page_revisions.get(key)
+            if force or last is None or self.db.revision() != last \
+                    or getattr(page, "_dirty", False):
+                page.refresh()
+                self._page_revisions[key] = self.db.revision()
         self._current = key
         self._update_nav(key)
 
@@ -151,6 +162,7 @@ class SidebarApp(tk.Tk):
             self._pages["today"] = page
         if hasattr(page, "current_date"):
             page.current_date = d
+            page._force_refresh = True
         self.show_page("today")
 
     def _create_page(self, key):
@@ -160,6 +172,7 @@ class SidebarApp(tk.Tk):
         from habit_checkin.ui.reflection_window import ReflectionWindow
         from habit_checkin.ui.question_type_mindmap_window import QuestionTypeMindmapWindow
         from habit_checkin.ui.settings_window import SettingsWindow
+        from habit_checkin.ui.knowledge_bank_window import KnowledgeBankWindow
         if key == "today":
             return TodayPage(self, self.db)
         if key == "study":
@@ -169,6 +182,8 @@ class SidebarApp(tk.Tk):
             return QuestionBankWindow(self, self.db)
         if key == "types":
             return QuestionTypeMindmapWindow(self, self.db)
+        if key == "knowledge":
+            return KnowledgeBankWindow(self, self.db)
         if key == "reflection":
             return ReflectionWindow(self, self.db)
         if key == "progress":
@@ -178,6 +193,16 @@ class SidebarApp(tk.Tk):
         if key == "settings":
             return SettingsWindow(self, self.db)
         raise KeyError(key)
+
+    def open_knowledge_doc(self, doc_id, block_id=None):
+        """思维导图跳转知识库：切到知识库页并定位文档/知识块。"""
+        page = self._pages.get("knowledge")
+        if page is None:
+            page = self._create_page("knowledge")
+            self._pages["knowledge"] = page
+        self.show_page("knowledge")
+        if hasattr(page, "open_doc"):
+            page.open_doc(doc_id, block_id=block_id)
 
     # ---------- 提醒 ----------
     def _poll_reminder(self):
@@ -432,8 +457,9 @@ class TodayPage(tk.Frame):
         ov.rowconfigure(0, weight=1, minsize=230)
         box = card(ov, padx=18, pady=18)
         box.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        box.columnconfigure(0, weight=1)
         inner = tk.Frame(box, bg=P["surface"])
-        inner.pack(fill="x")
+        inner.grid(row=0, column=0, sticky="ew")
         self.overall_ring = ProgressRing(inner, size=88, thickness=9, color=P["accent"])
         self.overall_ring.pack(side="left", padx=(0, 16))
         right = tk.Frame(inner, bg=P["surface"])
@@ -458,7 +484,7 @@ class TodayPage(tk.Frame):
         self.overall_rate_num = _stat(stats_row, "完成率", P["warning"])
         self.streak_num = _stat(stats_row, "连续打卡(天)", P["accent"])
         self.overall_progress = ttk.Progressbar(box, maximum=100)
-        self.overall_progress.pack(fill="x", pady=(12, 0))
+        self.overall_progress.grid(row=1, column=0, sticky="ew", pady=(12, 0))
 
         # 倒计时面板（独立卡片行，避免与统计横向拥挤；双击打开设置）
         cd_box = card(ov, padx=18, pady=18)
@@ -656,7 +682,7 @@ class TodayPage(tk.Frame):
             else:
                 timer_val = fmt_clock(int(it.get("elapsed_seconds") or 0)) or "00:00"
             task_tag = "〔辅〕" if it.get("task_type") == "aux" else "〔主〕"
-            goal = (it.get("note") or "").strip() or "—"
+            goal = to_plain(it.get("note") or "").strip() or "—"
             self.tree.insert("", "end", iid=str(it["id"]),
                              values=(status, task_tag + it["topic_path"], goal, remind, timer_val, checked),
                              tags=(tag,))
@@ -1065,7 +1091,9 @@ class TodayPage(tk.Frame):
     def _clear_timing(self, item_id):
         ok = messagebox.askyesno(
             "清除计时数据",
-            "确定清除该打卡项的计时数据吗？计时将归零。",
+            "确定清除该打卡项的计时数据吗？计时将归零。\n"
+            "该操作只影响计时时长，完成状态、打卡时间、文字总结、图片和题库收录均保留。\n"
+            "操作不可撤销，建议先在「设置 → 通用设置」中备份数据。",
             parent=self.master,
         )
         if not ok:
@@ -1079,7 +1107,9 @@ class TodayPage(tk.Frame):
     def _clear_checkin_time(self, item_id):
         ok = messagebox.askyesno(
             "清除打卡时间数据",
-            "确定清除该打卡项的打卡时间吗？完成状态会保留。",
+            "确定清除该打卡项的打卡时间吗？完成状态会保留，\n"
+            "文字总结、图片、计时和题库收录均不受影响。\n"
+            "操作不可撤销，建议先在「设置 → 通用设置」中备份数据。",
             parent=self.master,
         )
         if not ok:
@@ -1092,7 +1122,9 @@ class TodayPage(tk.Frame):
         ok = messagebox.askyesno(
             "清除打卡数据",
             "确定清除该打卡项的全部打卡数据吗？\n"
-            "完成状态、打卡时间、文字总结、图片和计时都会复原为未打卡状态。",
+            "完成状态、打卡时间、文字总结、图片和计时都会复原为未打卡状态。\n"
+            "题库中已收录的题目不会被删除，但来源关联会失效。\n"
+            "操作不可撤销，建议先在「设置 → 通用设置」中备份数据。",
             parent=self.master,
         )
         if not ok:

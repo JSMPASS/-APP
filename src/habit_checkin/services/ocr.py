@@ -1,16 +1,127 @@
-"""离线 OCR：调用 Windows 自带 WinRT OCR（优先简体中文），识别图片中的文字。
+"""离线 OCR：优先使用 PaddleOCR PP-OCRv5（准确率更高），失败时回退 WinRT OCR。
 
-实现：把 PowerShell 脚本写入临时文件，用 powershell -ExecutionPolicy Bypass -File 调用。
-注意不要使用 -WindowStyle Hidden（在该运行环境下会导致进程异常退出）。
-OCR 结果仅作预填，由用户确认/编辑。
+- PaddleOCR 模型目录默认为项目 data/models（目录使用模型本身名字），
+  可通过 HABIT_OCR_MODEL_DIR / HABIT_OCR_MODEL_ROOT 环境变量或设置页覆盖。
+- 初始化失败或模型目录缺失时自动回退 Windows 自带 WinRT OCR（简体中文优先）。
+- OCR 结果仅作预填，由用户确认/编辑。
 """
 from __future__ import annotations
 
 import os
 import re
 import tempfile
+import threading
+from pathlib import Path
+
+# 这些环境变量必须在导入 paddleocr 之前设置，因此放在模块顶部。
+os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "BOS")
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
 
 from habit_checkin.services.powershell import run_powershell_script
+
+_PADDLE_LOCK = threading.Lock()
+_PADDLE_OCR = None
+_PADDLE_INIT_ERROR = None
+_PADDLE_INIT_DEVICE = None
+_PADDLE_STRUCTURE_LOCK = threading.Lock()
+_PADDLE_STRUCTURE = None
+_PADDLE_STRUCTURE_INIT_ERROR = None
+_PADDLE_STRUCTURE_INIT_DEVICE = None
+
+
+def default_model_root():
+    """默认模型目录：项目根目录 data/models。"""
+    return str(Path(__file__).resolve().parent.parent.parent.parent / "data" / "models")
+
+
+def _resolve_model_root():
+    """返回当前生效的模型根目录，优先使用环境变量/设置页配置。"""
+    root = os.environ.get("HABIT_OCR_MODEL_DIR") or os.environ.get("HABIT_OCR_MODEL_ROOT")
+    if root:
+        root = str(root).strip().strip('"').strip("'")
+        if root:
+            return root
+    return default_model_root()
+
+
+def set_model_root(root):
+    """设置 OCR 模型根目录；传空值恢复默认目录。"""
+    root = (str(root).strip().strip('"').strip("'") if root else "") or ""
+    if root:
+        os.environ["HABIT_OCR_MODEL_DIR"] = root
+    else:
+        os.environ.pop("HABIT_OCR_MODEL_DIR", None)
+        os.environ.pop("HABIT_OCR_MODEL_ROOT", None)
+    reset_paddle_engines()
+
+
+def _paddle_device():
+    """当前生效的 Paddle 识别设备：cpu / gpu（设置页用 cuda 表示 GPU）。"""
+    value = (os.environ.get("HABIT_OCR_DEVICE") or "cpu").strip().lower()
+    return "gpu" if value in ("cuda", "gpu") else "cpu"
+
+
+def set_device(device):
+    """设置 Paddle 识别设备：cpu / cuda。切换后下一次识别按新设备初始化。"""
+    device = (device or "").strip().lower()
+    device = "cuda" if device in ("cuda", "gpu") else "cpu"
+    if device == "cuda":
+        os.environ["HABIT_OCR_DEVICE"] = "cuda"
+    else:
+        os.environ.pop("HABIT_OCR_DEVICE", None)
+    reset_paddle_engines()
+
+
+def set_engine(engine):
+    """设置识别引擎：paddle / winrt。切换后下一次识别按新引擎初始化。"""
+    engine = (engine or "").strip().lower()
+    if engine == "winrt":
+        os.environ["HABIT_OCR_ENGINE"] = "winrt"
+    else:
+        os.environ.pop("HABIT_OCR_ENGINE", None)
+    reset_paddle_engines()
+
+
+def reset_paddle_engines():
+    """清除 Paddle 单例缓存，使模型目录/引擎/设备变更立即生效。"""
+    global _PADDLE_OCR, _PADDLE_INIT_ERROR, _PADDLE_INIT_DEVICE
+    global _PADDLE_STRUCTURE, _PADDLE_STRUCTURE_INIT_ERROR, _PADDLE_STRUCTURE_INIT_DEVICE
+    with _PADDLE_LOCK:
+        _PADDLE_OCR = None
+        _PADDLE_INIT_ERROR = None
+        _PADDLE_INIT_DEVICE = None
+    with _PADDLE_STRUCTURE_LOCK:
+        _PADDLE_STRUCTURE = None
+        _PADDLE_STRUCTURE_INIT_ERROR = None
+        _PADDLE_STRUCTURE_INIT_DEVICE = None
+
+
+def apply_model_dir_from_setting(db):
+    """启动时把数据库里的 OCR 模型目录、引擎、设备配置写入环境变量。"""
+    if not hasattr(db, "get_setting"):
+        return
+    set_model_root(db.get_setting("ocr_model_dir", ""))
+    set_engine(db.get_setting("ocr_engine", "paddle"))
+    set_device(db.get_setting("ocr_device", "cpu"))
+
+
+def _paddle_dirs():
+    root = _resolve_model_root()
+    return (
+        root,
+        os.path.join(root, "PP-OCRv5_server_det"),
+        os.path.join(root, "PP-OCRv5_server_rec"),
+        os.path.join(root, "PicoDet-S_layout_17cls"),
+    )
+
+
+def _prepare_paddle_env():
+    root = _resolve_model_root()
+    os.environ.setdefault("PADDLE_PDX_CACHE_HOME", root)
+    os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "BOS")
+    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "False")
 
 _PS1 = r"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -144,6 +255,258 @@ def _run_ocr(path, timeout=20):
         return None
 
 
+def _paddle_models_ready():
+    """检测 PaddleOCR 两个模型目录是否已就绪（防止首次调用时误触发下载）。"""
+    root, det_dir, rec_dir, _layout_dir = _paddle_dirs()
+    return (
+        bool(root)
+        and os.path.isdir(det_dir)
+        and os.path.isdir(rec_dir)
+        and any(
+            os.path.isfile(os.path.join(det_dir, name))
+            for name in ("inference.pdmodel", "inference.pdiparams", "model.pdmodel")
+        )
+        and any(
+            os.path.isfile(os.path.join(rec_dir, name))
+            for name in ("inference.pdmodel", "inference.pdiparams", "model.pdmodel")
+        )
+    )
+
+
+def _init_paddle_ocr(device):
+    _prepare_paddle_env()
+    _root, det_dir, rec_dir, _layout_dir = _paddle_dirs()
+    from paddleocr import PaddleOCR
+    return PaddleOCR(
+        text_detection_model_name="PP-OCRv5_server_det",
+        text_detection_model_dir=det_dir,
+        text_recognition_model_name="PP-OCRv5_server_rec",
+        text_recognition_model_dir=rec_dir,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        device=device,
+    )
+
+
+def _get_paddle_ocr():
+    """惰性初始化 PaddleOCR 单例；设备切换或 CUDA 失败时自动重建/回退 CPU。"""
+    global _PADDLE_OCR, _PADDLE_INIT_ERROR, _PADDLE_INIT_DEVICE
+    device = _paddle_device()
+    if _PADDLE_OCR is not None and _PADDLE_INIT_DEVICE == device:
+        return _PADDLE_OCR
+    if _PADDLE_INIT_ERROR is not None and _PADDLE_INIT_DEVICE == device:
+        return None
+    if not _paddle_models_ready():
+        _PADDLE_INIT_DEVICE = device
+        _PADDLE_INIT_ERROR = "PaddleOCR 模型目录不存在或缺少模型文件"
+        return None
+    with _PADDLE_LOCK:
+        if _PADDLE_OCR is not None and _PADDLE_INIT_DEVICE == device:
+            return _PADDLE_OCR
+        try:
+            engine = _init_paddle_ocr(device)
+            _PADDLE_OCR = engine
+            _PADDLE_INIT_DEVICE = device
+            _PADDLE_INIT_ERROR = None
+            return engine
+        except Exception as exc:  # 初始化失败时回退 WinRT，不阻塞用户
+            _PADDLE_INIT_DEVICE = device
+            if device == "gpu":
+                # CUDA 不可用（缺少 paddlepaddle-gpu / 驱动 / 显存）时自动回退 CPU，
+                # 不缓存失败状态，保证下次识别直接走 CPU。
+                os.environ["HABIT_OCR_DEVICE"] = "cpu"
+                _PADDLE_OCR = None
+                _PADDLE_INIT_DEVICE = None
+                _PADDLE_INIT_ERROR = None
+                try:
+                    engine = _init_paddle_ocr("cpu")
+                    _PADDLE_OCR = engine
+                    _PADDLE_INIT_DEVICE = "cpu"
+                    return engine
+                except Exception as cpu_exc:
+                    _PADDLE_INIT_DEVICE = "cpu"
+                    _PADDLE_INIT_ERROR = "PaddleOCR 初始化失败：{}".format(cpu_exc)
+                    return None
+            _PADDLE_INIT_ERROR = str(exc)
+            return None
+
+
+def _paddle_layout_ready():
+    """检测 PP-StructureV3 布局模型是否已就绪（防止首次调用时误触发下载）。"""
+    _root, _det_dir, _rec_dir, layout_dir = _paddle_dirs()
+    return (
+        os.path.isdir(layout_dir)
+        and any(
+            os.path.isfile(os.path.join(layout_dir, name))
+            for name in ("inference.pdmodel", "inference.pdiparams", "model.pdmodel")
+        )
+    )
+
+
+def _init_paddle_structure(device):
+    _prepare_paddle_env()
+    _root, det_dir, rec_dir, layout_dir = _paddle_dirs()
+    from paddleocr import PPStructureV3
+    return PPStructureV3(
+        layout_detection_model_name="PicoDet-S_layout_17cls",
+        layout_detection_model_dir=layout_dir,
+        text_detection_model_name="PP-OCRv5_server_det",
+        text_detection_model_dir=det_dir,
+        text_recognition_model_name="PP-OCRv5_server_rec",
+        text_recognition_model_dir=rec_dir,
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        use_seal_recognition=False,
+        use_table_recognition=False,
+        use_formula_recognition=False,
+        use_chart_recognition=False,
+        use_region_detection=False,
+        device=device,
+    )
+
+
+def _get_paddle_structure():
+    """惰性初始化 PP-StructureV3 单例；设备切换或 CUDA 失败时自动重建/回退 CPU。"""
+    global _PADDLE_STRUCTURE, _PADDLE_STRUCTURE_INIT_ERROR, _PADDLE_STRUCTURE_INIT_DEVICE
+    device = _paddle_device()
+    if _PADDLE_STRUCTURE is not None and _PADDLE_STRUCTURE_INIT_DEVICE == device:
+        return _PADDLE_STRUCTURE
+    if _PADDLE_STRUCTURE_INIT_ERROR is not None and _PADDLE_STRUCTURE_INIT_DEVICE == device:
+        return None
+    if not _paddle_layout_ready():
+        _PADDLE_STRUCTURE_INIT_DEVICE = device
+        _PADDLE_STRUCTURE_INIT_ERROR = "布局模型目录不存在或缺少模型文件"
+        return None
+    with _PADDLE_STRUCTURE_LOCK:
+        if _PADDLE_STRUCTURE is not None and _PADDLE_STRUCTURE_INIT_DEVICE == device:
+            return _PADDLE_STRUCTURE
+        try:
+            structure = _init_paddle_structure(device)
+            _PADDLE_STRUCTURE = structure
+            _PADDLE_STRUCTURE_INIT_DEVICE = device
+            _PADDLE_STRUCTURE_INIT_ERROR = None
+            return structure
+        except Exception as exc:  # 初始化失败时回退普通 OCR，不阻塞用户
+            _PADDLE_STRUCTURE_INIT_DEVICE = device
+            if device == "gpu":
+                os.environ["HABIT_OCR_DEVICE"] = "cpu"
+                _PADDLE_STRUCTURE = None
+                _PADDLE_STRUCTURE_INIT_DEVICE = None
+                _PADDLE_STRUCTURE_INIT_ERROR = None
+                try:
+                    structure = _init_paddle_structure("cpu")
+                    _PADDLE_STRUCTURE = structure
+                    _PADDLE_STRUCTURE_INIT_DEVICE = "cpu"
+                    return structure
+                except Exception as cpu_exc:
+                    _PADDLE_STRUCTURE_INIT_DEVICE = "cpu"
+                    _PADDLE_STRUCTURE_INIT_ERROR = "布局识别初始化失败：{}".format(cpu_exc)
+                    return None
+            _PADDLE_STRUCTURE_INIT_ERROR = str(exc)
+            return None
+
+
+def _block_attr(item, name, default=None):
+    """从 PP-StructureV3 布局块（dict 或对象）中取字段。"""
+    try:
+        if isinstance(item, dict):
+            return item.get(name, default)
+        return getattr(item, name, default)
+    except Exception:
+        return default
+
+
+def _page_structured_records(page):
+    """把一页 PP-StructureV3 的解析块整理成按阅读顺序排列的记录。"""
+    records = []
+    for item in page.get("parsing_res_list") or []:
+        label = str(_block_attr(item, "label") or "").strip().lower()
+        content = str(_block_attr(item, "content") or "").strip()
+        if not content:
+            continue
+        order = _block_attr(item, "order_index")
+        if order is None:
+            order = _block_attr(item, "index")
+        records.append({
+            "label": label,
+            "content": content,
+            "bbox": _block_attr(item, "bbox") or [],
+            "order": int(order) if order is not None else len(records),
+        })
+    records.sort(key=lambda r: r["order"])
+    return records
+
+
+def ocr_structured_blocks(path):
+    """用 PP-StructureV3 识别页面布局，返回按顺序的 [{label, content, bbox, order}]。
+
+    保留标题（paragraph_title/doc_title 等）与正文的原始结构，供知识库按标题段落切分。
+    模型缺失、初始化失败或识别异常时返回 None，由调用方回退普通 OCR。
+    """
+    if os.environ.get("HABIT_OCR_ENGINE", "paddle").lower() == "winrt":
+        return None
+    structure = _get_paddle_structure()
+    if structure is None:
+        return None
+    try:
+        pages = structure.predict(path)
+        records = []
+        for page in pages or []:
+            records.extend(_page_structured_records(page))
+        return records or None
+    except Exception:
+        return None
+
+def _poly_to_xy(poly, fallback_box):
+    """从识别框取左上角坐标：优先用四边形各点最小值，失败时用整框坐标。"""
+    try:
+        pts = list(poly)
+        xs = [float(p[0]) for p in pts]
+        ys = [float(p[1]) for p in pts]
+        return int(min(xs)), int(min(ys))
+    except Exception:
+        try:
+            box = list(fallback_box)
+            return int(box[0]), int(box[1])
+        except Exception:
+            return 0, 0
+
+
+def _run_paddle_ocr(path, timeout=20):
+    """运行 PaddleOCR，返回 [(x, y, text)]；失败返回 None。"""
+    engine = _get_paddle_ocr()
+    if engine is None:
+        return None
+    try:
+        results = engine.predict(path)
+        out = []
+        for page in results:
+            texts = page.get("rec_texts") or []
+            polys = page.get("rec_polys") or []
+            boxes = page.get("rec_boxes") or []
+            for i, text in enumerate(texts):
+                if not text or not str(text).strip():
+                    continue
+                poly = polys[i] if i < len(polys) else None
+                box = boxes[i] if i < len(boxes) else None
+                x, y = _poly_to_xy(poly, box)
+                out.append((x, y, str(text)))
+        return out or None
+    except Exception:
+        return None
+
+
+def _ocr_engine_candidates(keep_marks=False):
+    """返回识别引擎候选列表：Paddle 优先，WinRT 兜底。"""
+    engines = []
+    if os.environ.get("HABIT_OCR_ENGINE", "paddle").lower() != "winrt":
+        engines.append(_run_paddle_ocr)
+    engines.append(_run_ocr)
+    return engines
+
+
 def ocr_image_lines(path, timeout=20, keep_marks=False):
     """识别单张图片（先预处理提升准确率），返回按行清理后的文字列表；失败返回 None。
 
@@ -155,6 +518,12 @@ def ocr_image_lines(path, timeout=20, keep_marks=False):
             pre = preprocess_for_ocr(path, keep_marks=keep_marks)
         except Exception:
             pre = None
+        # Paddle 直接识别原图（保留红笔/彩色信息），不重复跑预处理图；
+        # WinRT 仍按原顺序试预处理图和原图。
+        if os.environ.get("HABIT_OCR_ENGINE", "paddle").lower() != "winrt":
+            lines = _run_paddle_ocr(path, timeout=timeout)
+            if lines:
+                return [cleanup_cjk_spaces(t).strip() for _, _, t in lines if t.strip()]
         for candidate in (pre, path):
             if not candidate:
                 continue
@@ -174,6 +543,15 @@ def ocr_lines_with_y(path, timeout=20, keep_marks=False):
             pre = preprocess_for_ocr(path, keep_marks=keep_marks)
         except Exception:
             pre = None
+        if os.environ.get("HABIT_OCR_ENGINE", "paddle").lower() != "winrt":
+            lines = _run_paddle_ocr(path, timeout=timeout)
+            if lines:
+                out = []
+                for x, y, t in lines:
+                    t2 = cleanup_cjk_spaces(t).strip()
+                    if t2:
+                        out.append((int(x), int(y), t2))
+                return out
         for candidate in (pre, path):
             if not candidate:
                 continue

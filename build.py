@@ -54,6 +54,14 @@ def build():
         os.environ.setdefault("TCL_LIBRARY", str(tcl))
         if (tk / "tk.tcl").is_file():
             os.environ.setdefault("TK_LIBRARY", str(tk))
+    try:
+        import pystray  # noqa: F401
+    except ImportError:
+        print("[提示] 缺少托盘依赖 pystray，正在安装 ...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "pystray"],
+            check=True,
+        )
     close_running_app()
     if DIST.exists():
         shutil.rmtree(DIST)

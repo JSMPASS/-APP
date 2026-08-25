@@ -24,6 +24,7 @@ from habit_checkin.services.export_common import (
     result_text,
     weekday_cn,
 )
+from habit_checkin.ui.richtext import to_plain
 
 
 def _set_cn_font(run, name="微软雅黑", size=None, bold=None, color=None):
@@ -124,7 +125,7 @@ def export_docx(db, start_date, end_date, out_path):
                     title.add_run("{}（打卡时间 {}{}）".format(it["topic_path"], checked, title_suffix)),
                     size=12, bold=True,
                 )
-                note = (it["note"] or "").strip()
+                note = to_plain(it.get("note") or "").strip()
                 note_p = doc.add_paragraph()
                 _set_cn_font(note_p.add_run("文字总结："), size=11, bold=True)
                 if note:
@@ -146,21 +147,23 @@ def export_docx(db, start_date, end_date, out_path):
                 )
                 qp = doc.add_paragraph()
                 _set_cn_font(qp.add_run("题目内容："), size=11, bold=True)
-                if q["question_text"]:
-                    _set_cn_font(qp.add_run(q["question_text"]), size=11)
+                question_text = to_plain(q.get("question_text") or "").strip()
+                if question_text:
+                    _set_cn_font(qp.add_run(question_text), size=11)
                 else:
                     _set_cn_font(qp.add_run("（未填写）"), size=11, color=RGBColor(0x80, 0x80, 0x80))
                 ap = doc.add_paragraph()
                 _set_cn_font(ap.add_run("解析："), size=11, bold=True)
-                if q["analysis"]:
-                    _set_cn_font(ap.add_run(q["analysis"]), size=11)
+                analysis = to_plain(q.get("analysis") or "").strip()
+                if analysis:
+                    _set_cn_font(ap.add_run(analysis), size=11)
                 else:
                     _set_cn_font(ap.add_run("（未填写）"), size=11, color=RGBColor(0x80, 0x80, 0x80))
                 _embed_images(doc, tmpdir, db, qimages.get(q["id"], []))
                 filled = bool(
-                    (q.get("self_analysis") or "").strip()
-                    or (q.get("correct_analysis") or "").strip()
-                    or (q.get("reflection") or "").strip()
+                    to_plain(q.get("self_analysis") or "").strip()
+                    or to_plain(q.get("correct_analysis") or "").strip()
+                    or to_plain(q.get("reflection") or "").strip()
                 )
                 if q["result"] == "wrong" or filled:
                     if not filled:
@@ -175,7 +178,7 @@ def export_docx(db, start_date, end_date, out_path):
                             ("正确的做题思路", "correct_analysis"),
                             ("复盘心得", "reflection"),
                         ):
-                            val = (q.get(key) or "").strip()
+                            val = to_plain(q.get(key) or "").strip()
                             rp2 = doc.add_paragraph()
                             _set_cn_font(rp2.add_run("　{}：".format(label)), size=11, bold=True)
                             _set_cn_font(rp2.add_run(val or "（未填写）"), size=11)

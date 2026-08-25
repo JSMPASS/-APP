@@ -12,7 +12,7 @@ from habit_checkin.services.study_plan import (
     save_plan_config, stage_for,
 )
 from habit_checkin.services import plan_docs
-from habit_checkin.ui.common import ScrollableFrame, setup_styles
+from habit_checkin.ui.common import EmptyState, ScrollableFrame, setup_styles
 from habit_checkin.ui.heatmap import CalendarHeatmap
 from habit_checkin.ui.theme import PALETTE, card, dialog_header
 
@@ -92,17 +92,16 @@ class StudyProgressPage(tk.Frame):
             return DEFAULT_START
 
     def _render_not_started(self, start, day):
-        P = PALETTE
         box = card(self._container, padx=24, pady=30)
         box.pack(fill="x", pady=12)
-        tk.Label(box, text="还没有开始备考计划", bg=P["surface"], fg=P["text"],
-                 font=("Microsoft YaHei UI", 28, "bold")).pack()
-        tk.Label(box, text="默认开始日期：{}（第 1 天）。点击「一键铺排计划」生成每日任务后，"
-                           "本页将展示阶段 / 周 / 检查点导航。".format(start.isoformat()),
-                 bg=P["surface"], fg=P["muted"], font=("Microsoft YaHei UI", 15),
-                 wraplength=1400, justify="left").pack(pady=(8, 0), anchor="w")
-        ttk.Button(box, text="一键铺排计划", style="Accent.TButton",
-                   command=self._open_generate).pack(anchor="w", pady=(14, 0))
+        EmptyState(
+            box,
+            title="还没有开始备考计划",
+            description="默认开始日期：{}（第 1 天）。点击「一键铺排计划」生成每日任务后，\n"
+                        "本页将展示阶段 / 周 / 检查点导航。".format(start.isoformat()),
+            action_text="一键铺排计划",
+            command=self._open_generate,
+        ).pack()
 
     # ---------- 总览 ----------
     def _render_overview(self, start, today, day, daily, cfg):
@@ -460,13 +459,18 @@ class StudyProgressPage(tk.Frame):
             messagebox.showerror("导入失败", str(exc), parent=self)
             return
         self.refresh()
+        skipped = ""
+        if result.get("skipped_days"):
+            skipped = "\n已保留有内容的打卡日：{} 天（{} 项）".format(
+                result["skipped_days"], result.get("skipped_items", 0))
         messagebox.showinfo(
             "导入完成",
-            "开始日期：{}\n同步天数：{}\n同步任务数：{}\n{}".format(
+            "开始日期：{}\n同步天数：{}\n同步任务数：{}\n{}{}".format(
                 result["start"],
                 result.get("days", 0),
                 result.get("items", 0),
                 "仅更新了开始日期" if result.get("updated_start_only") else "每日计划已同步",
+                skipped,
             ),
             parent=self,
         )

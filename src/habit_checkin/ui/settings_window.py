@@ -140,6 +140,65 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
             justify="left",
         ).pack(anchor="w", pady=(12, 0))
 
+        ttk.Separator(tab, orient="horizontal").pack(fill="x", pady=(16, 8))
+        tk.Label(tab, text="识别模型", bg=PALETTE["bg"], fg=PALETTE["text"],
+                 font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
+        ocr_row = tk.Frame(tab, bg=PALETTE["bg"])
+        ocr_row.pack(anchor="w", fill="x", pady=(8, 0))
+        self.ocr_model_var = tk.StringVar(value=self.db.get_setting("ocr_model_dir", ""))
+        ocr_entry = ttk.Entry(ocr_row, textvariable=self.ocr_model_var)
+        ocr_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(ocr_row, text="保存", command=self._save_ocr_model_dir).pack(side="left")
+        ttk.Button(ocr_row, text="恢复默认", command=self._reset_ocr_model_dir).pack(side="left", padx=(6, 0))
+        engine_row = tk.Frame(tab, bg=PALETTE["bg"])
+        engine_row.pack(anchor="w", fill="x", pady=(8, 0))
+        tk.Label(engine_row, text="识别引擎：", bg=PALETTE["bg"], fg=PALETTE["text"],
+                 font=("Microsoft YaHei UI", 12)).pack(side="left")
+        self.ocr_engine_var = tk.StringVar(value=self.db.get_setting("ocr_engine", "paddle"))
+        engine_cb = ttk.Combobox(
+            engine_row,
+            textvariable=self.ocr_engine_var,
+            state="readonly",
+            width=18,
+            values=("paddle", "winrt"),
+        )
+        engine_cb.pack(side="left")
+        tk.Label(
+            engine_row,
+            text="PaddleOCR（高精度）/ Windows 自带 OCR（无需模型）",
+            bg=PALETTE["bg"],
+            fg=PALETTE["muted"],
+            font=("Microsoft YaHei UI", 11),
+        ).pack(side="left", padx=(8, 0))
+        device_row = tk.Frame(tab, bg=PALETTE["bg"])
+        device_row.pack(anchor="w", fill="x", pady=(8, 0))
+        tk.Label(device_row, text="识别设备：", bg=PALETTE["bg"], fg=PALETTE["text"],
+                 font=("Microsoft YaHei UI", 12)).pack(side="left")
+        self.ocr_device_var = tk.StringVar(value=self.db.get_setting("ocr_device", "cpu"))
+        device_cb = ttk.Combobox(
+            device_row,
+            textvariable=self.ocr_device_var,
+            state="readonly",
+            width=18,
+            values=("cpu", "cuda"),
+        )
+        device_cb.pack(side="left")
+        tk.Label(
+            device_row,
+            text="CUDA 需安装 paddlepaddle-gpu；不可用时自动回退 CPU",
+            bg=PALETTE["bg"],
+            fg=PALETTE["muted"],
+            font=("Microsoft YaHei UI", 11),
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            tab,
+            text="留空使用内置 data/models 目录；可填写 F:\\paddle_models 等已有模型目录，\n"
+                 "目录内需包含 PP-OCRv5_server_det、PP-OCRv5_server_rec 等模型子目录。\n"
+                 "切换引擎或设备后，下一次识别自动生效。",
+            style="Hint.TLabel",
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
         self.dark_var = tk.BooleanVar(value=self.db.get_bool_setting("dark_mode", False))
         dark_cb = TextCheck(
             tab, "深色模式（重启应用后生效）",
@@ -210,6 +269,23 @@ class SettingsWindow(TopicTreeMixin, tk.Frame):
 
     def _save_close_action(self):
         self.db.set_setting("close_action", self.close_action_var.get())
+
+    def _save_ocr_model_dir(self):
+        from habit_checkin.services.ocr import set_device, set_engine, set_model_root
+        raw = self.ocr_model_var.get().strip()
+        self.db.set_setting("ocr_model_dir", raw)
+        engine = self.ocr_engine_var.get().strip().lower() or "paddle"
+        device = self.ocr_device_var.get().strip().lower() or "cpu"
+        self.db.set_setting("ocr_engine", engine)
+        self.db.set_setting("ocr_device", device)
+        set_model_root(raw)
+        set_engine(engine)
+        set_device(device)
+        messagebox.showinfo("已保存", "识别设置已更新，下一次识别时生效。", parent=self)
+
+    def _reset_ocr_model_dir(self):
+        self.ocr_model_var.set("")
+        self._save_ocr_model_dir()
 
     def _reset_stats(self):
         from datetime import date

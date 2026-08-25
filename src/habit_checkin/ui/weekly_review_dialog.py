@@ -83,8 +83,8 @@ class WeeklyReviewDialog(tk.Toplevel):
             self.next_focus.insert("1.0", review.get("next_focus") or "")
 
     def _save(self):
-        review = self.review_text.get("1.0", "end").strip()
-        focus = self.next_focus.get("1.0", "end").strip()
+        review = self.review_text.get_html().strip()
+        focus = self.next_focus.get_html().strip()
         if not review and not focus:
             messagebox.showwarning("保存复盘", "请至少填写一项内容。", parent=self)
             return

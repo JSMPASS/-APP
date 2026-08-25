@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 _FIELD_LABELS = (
-    ("recognition", "识别方法"),
+    ("recognition", "识别题型"),
     ("approach", "解题思路"),
     ("method", "解题方法"),
     ("remark", "备注"),

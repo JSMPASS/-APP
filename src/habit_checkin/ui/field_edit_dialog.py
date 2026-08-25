@@ -11,9 +11,11 @@ import tkinter as tk
 from datetime import date
 from tkinter import colorchooser, messagebox, ttk
 
+from habit_checkin.services.clipboard_utils import bind_entry_undo, paste_clipboard_text
 from habit_checkin.ui.animate import fade_in
 from habit_checkin.ui.calendar import CalendarPopup
 from habit_checkin.ui.common import ScrollableFrame, center_window, setup_styles
+from habit_checkin.ui.richtext import RichTextInput, looks_like_html
 from habit_checkin.ui.theme import PALETTE, dialog_header
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
@@ -28,25 +30,93 @@ def ask_fields(master, title, fields, subtitle=None):
     return dlg.result
 
 
-class FieldTextArea(tk.Text):
-    """统一风格多行文本域：与编辑页控件一致，支持字数统计。"""
+class FieldTextArea(tk.Frame):
+    """统一富文本多行输入：工具栏 + 内容区，兼容旧调用方的 Text 风格接口。
+
+    底层使用 RichTextArea，保存时通过 get_html() 取得轻量 HTML；
+    get("1.0", "end") 等旧接口继续返回纯文本，方便 OCR、字数统计等逻辑复用。
+    """
 
     def __init__(self, master, text="", height=8, count_label=None,
                  on_change=None, **kw):
         P = PALETTE
-        super().__init__(
-            master, height=height, wrap="word",
-            font=("Microsoft YaHei UI", 12),
-            bg=P["input"], fg=P["text"], relief="flat",
-            highlightthickness=1, highlightbackground=P["border"],
-            highlightcolor=P["focus"], insertbackground=P["text"], **kw,
-        )
+        super().__init__(master, bg=P["bg"], **kw)
         self._count_label = count_label
         self._on_change = on_change
+        self.input = RichTextInput(self, height=height)
+        self.input.pack(fill="both", expand=True)
+        self.text = self.input.text
         if text:
-            self.insert("1.0", text)
-        self.bind("<KeyRelease>", self._on_key)
+            self.set_initial(text)
+        self.text.bind("<KeyRelease>", self._on_key)
         self._update_count()
+
+    def set_initial(self, value):
+        """兼容旧数据：HTML 原样载入，纯文本自动转成富文本段落。"""
+        if looks_like_html(value):
+            self.set_html(value)
+        else:
+            self.set_plain(value)
+
+    def set_html(self, html):
+        self.text.set_html(html)
+        self._update_count()
+
+    def get_html(self):
+        return self.text.get_html()
+
+    def set_plain(self, text):
+        self.text.set_plain(text)
+        self._update_count()
+
+    def get_plain(self):
+        return self.text.get_plain()
+
+    def get_value(self):
+        return self.get_html()
+
+    def insert(self, index, chars, *args):
+        """兼容旧调用：HTML 旧数据直接渲染，普通文本追加为富文本段落。"""
+        if looks_like_html(chars):
+            self.set_html(chars)
+        elif index == "end" and self.get_plain():
+            self.text.append_plain(chars)
+        else:
+            self.text.insert(index, chars, *args)
+        self._update_count()
+
+    def delete(self, index1, index2=None):
+        self.text.delete(index1, index2)
+        self._update_count()
+
+    def get(self, index1, index2=None):
+        return self.text.get(index1, index2)
+
+    def image_create(self, index, **kw):
+        return self.text.image_create(index, **kw)
+
+    def tag_add(self, tagname, index1, index2=None):
+        return self.text.tag_add(tagname, index1, index2)
+
+    def tag_remove(self, tagname, index1, index2=None):
+        return self.text.tag_remove(tagname, index1, index2)
+
+    def configure(self, cnf=None, **kw):
+        """把 Text 相关选项转发到底层内容区，窗口背景等留在容器自身。"""
+        if cnf is None:
+            return self.text.configure(**kw)
+        if isinstance(cnf, str):
+            return self.text.configure(cnf, **kw)
+        text_opts = {k: v for k, v in cnf.items() if k != "bg"}
+        if text_opts:
+            self.text.configure(**text_opts)
+        return None
+
+    def bind(self, sequence=None, func=None, add=None):
+        return self.text.bind(sequence, func, add)
+
+    def focus_set(self):
+        self.text.focus_set()
 
     def _on_key(self, event):
         self._update_count()
@@ -56,7 +126,7 @@ class FieldTextArea(tk.Text):
     def _update_count(self):
         if self._count_label:
             try:
-                n = len(self.get("1.0", "end-1c"))
+                n = len(self.get_plain())
             except tk.TclError:
                 n = 0
             self._count_label.configure(text="{} 字".format(n))
@@ -80,18 +150,23 @@ class _PlaceholderEntry(tk.Entry):
         self.bind("<FocusIn>", self._on_focus_in)
         self.bind("<FocusOut>", self._on_focus_out)
         self.bind("<KeyRelease>", self._on_key)
+        self.bind("<Control-v>", self._on_paste)
         if initial:
             self.insert(0, initial)
         self._sync_placeholder()
+        self._undo = bind_entry_undo(self)
 
     def _on_focus_in(self, event):
         if self._ph:
             self.delete(0, "end")
             self._ph = False
             self.configure(fg=self._normal_fg)
+            self._undo.reset()
 
     def _on_focus_out(self, event):
         self._sync_placeholder()
+        if self._ph:
+            self._undo.reset()
 
     def _on_key(self, event):
         if self._ph:
@@ -100,6 +175,23 @@ class _PlaceholderEntry(tk.Entry):
             self.configure(fg=self._normal_fg)
         if self._on_change:
             self._on_change()
+
+    def _on_paste(self, event):
+        if self._ph:
+            self.delete(0, "end")
+            self._ph = False
+            self.configure(fg=self._normal_fg)
+        text = paste_clipboard_text(self)
+        if not text:
+            return None
+        try:
+            self.delete("sel.first", "sel.last")
+        except tk.TclError:
+            pass
+        self.insert("insert", text)
+        if self._on_change:
+            self._on_change()
+        return "break"
 
     def _sync_placeholder(self):
         if self._placeholder and not self.get().strip():
@@ -118,6 +210,7 @@ class _PlaceholderEntry(tk.Entry):
         if value:
             self.insert(0, value)
         self._sync_placeholder()
+        self._undo.reset()
 
 
 class FieldEditDialog(tk.Toplevel):
@@ -233,12 +326,14 @@ class FieldEditDialog(tk.Toplevel):
                 on_change=self._mark_dirty,
             )
             text.pack(fill="both", expand=True, pady=(2, 0))
-            text.bind("<Control-Return>", lambda e: self._save())
+            text.input.text.bind("<Control-Return>", lambda e: self._save())
             ctl["text"] = text
         elif ftype == "bool":
             var = tk.BooleanVar(value=bool(field.get("value")))
             cb = ttk.Checkbutton(cell, text=field.get("check_text", ""),
                                  variable=var, command=self._mark_dirty)
+            if field.get("disabled"):
+                cb.configure(state="disabled")
             cb.pack(anchor="w", pady=(2, 0))
             ctl["var"] = var
         else:
@@ -314,7 +409,7 @@ class FieldEditDialog(tk.Toplevel):
         for key, ctl in self._widgets.items():
             kind = ctl["kind"]
             if kind == "multiline":
-                values[key] = ctl["text"].get("1.0", "end").strip()
+                values[key] = ctl["text"].get_html().strip()
             elif kind == "bool":
                 values[key] = bool(ctl["var"].get())
             elif kind == "choice":

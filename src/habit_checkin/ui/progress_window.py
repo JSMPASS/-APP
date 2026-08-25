@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from habit_checkin.ui.animate import count_up, fade_in
-from habit_checkin.ui.common import center_window, setup_styles
+from habit_checkin.ui.common import EmptyState, center_window, setup_styles
 from habit_checkin.ui.field_edit_dialog import ask_fields
 from habit_checkin.ui.progress_ring import ProgressRing
 from habit_checkin.ui.theme import PALETTE, card, dialog_header
@@ -118,16 +118,15 @@ class ProgressWindow(tk.Frame):
             self._render_card(box, m)
 
     def _render_empty(self):
-        P = PALETTE
         box = card(self.cards, padx=24, pady=34)
         box.grid(row=0, column=0, columnspan=3, sticky="nsew", pady=10)
-        tk.Label(box, text="还没有启用的指标", bg=P["surface"], fg=P["text"],
-                 font=("Microsoft YaHei UI", 17, "bold")).pack()
-        tk.Label(box, text="点击右上角「管理指标」开启内置指标，或新建自定义指标。",
-                 bg=P["surface"], fg=P["muted"], font=("Microsoft YaHei UI", 13)
-                 ).pack(pady=(8, 0))
-        ttk.Button(box, text="管理指标", style="Accent.TButton",
-                   command=self._manage).pack(pady=(14, 0))
+        EmptyState(
+            box,
+            title="还没有启用的指标",
+            description="点击「管理指标」开启内置指标，或新建自定义指标。",
+            action_text="管理指标",
+            command=self._manage,
+        ).pack(fill="both", expand=True)
 
     def _render_card(self, box, m):
         P = PALETTE

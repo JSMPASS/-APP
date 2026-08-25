@@ -6,6 +6,7 @@ from datetime import date
 from tkinter import messagebox, ttk
 
 from habit_checkin.db import validate_date, validate_time
+from habit_checkin.services.clipboard_utils import bind_entry_undo, bind_text_paste
 from habit_checkin.ui.calendar import attach_calendar_on_click
 from habit_checkin.ui.common import ScrollableFrame, TimePicker, setup_styles
 from habit_checkin.ui.animate import fade_in
@@ -55,7 +56,9 @@ class PlanDialog(TopicTreeMixin, tk.Toplevel):
         top.pack(fill="x")
         ttk.Label(top, text="日期：").pack(side="left")
         self.date_entry = ttk.Entry(top, width=12)
+        bind_text_paste(self.date_entry)
         self.date_entry.insert(0, self.date_str)
+        bind_entry_undo(self.date_entry)
         self.date_entry.pack(side="left", padx=(0, 6))
         attach_calendar_on_click(self.date_entry, lambda ds: self._set_date(ds))
         ttk.Button(top, text="今天", command=lambda: self._set_date(date.today().isoformat())).pack(
@@ -257,7 +260,8 @@ class PlanDialog(TopicTreeMixin, tk.Toplevel):
             names = "\n".join("· {}".format(it["topic_path"]) for it in removed_with_data)
             ok = messagebox.askyesno(
                 "删除确认",
-                "以下打卡项已被取消勾选，且已有打卡内容，删除后不可恢复：\n{}\n\n是否删除？".format(names),
+                "以下打卡项已被取消勾选，且已有打卡内容，删除后不可恢复：\n{}\n\n"
+                "题库题目将保留为未分类，来源标记失效。是否删除？".format(names),
                 parent=self,
             )
             if not ok:

@@ -5,6 +5,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from habit_checkin.services.clipboard_utils import cleanup_temp_files, paste_clipboard_images
 from habit_checkin.services.ocr import format_questions_text, normalize_ocr_text, ocr_image_lines, parse_ocr_questions, reconstruct_page, split_figure_stems
 from habit_checkin.ui.common import ScrollableFrame, TextCheck, center_window, make_thumbnail, setup_styles, show_image_zoom
 from habit_checkin.ui.animate import fade_in
@@ -19,24 +20,33 @@ _FILETYPES = [("图片", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff"), 
 
 class QuestionFormDialog(tk.Toplevel):
     def __init__(self, master, db, question=None, prefill_images=None,
-                 prefill_topic_id=None, source="manual", source_item_id=None,
+                 prefill_topic_id=None, prefill_detail_type_id=None,
+                 source="manual", source_item_id=None,
                  question_list=None, index=0):
         super().__init__(master)
         self.db = db
         self.question = question
         self.images = []  # {rel, abs, tk, label, frame}
         self.saved_question = None
+        self._clipboard_tmp = []
         self._source = source
         self._source_item_id = source_item_id
+        self._prefill_detail_type_id = prefill_detail_type_id
         self._qlist = question_list if question_list else ([question] if question else [])
         self._index = index
         self._analysis_queue = []
         self.result_var = tk.StringVar(value="未判定")
         self.reason_var = tk.StringVar(value="")
         self.topic_var = tk.StringVar(value="（未分类）")
+        self.detail_var = tk.StringVar(value="（未细分）")
+        self.material_var = tk.StringVar(value="（无材料）")
+        self._detail_options = []
+        self._material_options = []
+        self.detail_id_map = {}
+        self.material_label_map = {}
         self.title("编辑题目" if question else "新增题目")
-        self.geometry("760x920")
-        self.minsize(700, 800)
+        self.geometry("900x960")
+        self.minsize(760, 860)
         self.transient(master)
         setup_styles(self)
         self.configure(bg=PALETTE["bg"])
@@ -44,6 +54,8 @@ class QuestionFormDialog(tk.Toplevel):
         self._load_initial(question, prefill_images, prefill_topic_id)
         center_window(self)
         self.bind("<Delete>", self._on_delete_key)
+        self.bind("<Control-v>", self._on_paste_images)
+        self.bind("<Destroy>", self._on_destroy_clipboard_cleanup, add="+")
         self.grab_set()
         self.focus_set()
         fade_in(self)
@@ -72,6 +84,8 @@ class QuestionFormDialog(tk.Toplevel):
         tk.Label(row1, text="知识点分类：", bg=P["card"]).pack(side="left")
         self.topic_box = ttk.Combobox(row1, textvariable=self.topic_var, state="readonly", width=34)
         self.topic_box.pack(side="left")
+        self.topic_box.bind("<<ComboboxSelected>>", self._on_topic_selected)
+        ttk.Button(row1, text="管理科目", command=self._open_topic_manager).pack(side="left", padx=(6, 0))
         tk.Label(row1, text="对错：", bg=P["card"]).pack(side="left", padx=(16, 0))
         self.result_box = ttk.Combobox(row1, textvariable=self.result_var, state="readonly",
                                        values=["未判定", "正确", "错误"], width=8)
@@ -80,6 +94,31 @@ class QuestionFormDialog(tk.Toplevel):
         self.reason_box = ttk.Combobox(row1, textvariable=self.reason_var, state="readonly", width=14)
         self.reason_box.pack(side="left")
         self.result_box.bind("<<ComboboxSelected>>", lambda e: self._update_reasons())
+        meta_row2 = tk.Frame(meta, bg=P["card"])
+        meta_row2.pack(fill="x", pady=(8, 0))
+        tk.Label(meta_row2, text="细分分类：", bg=P["card"]).pack(side="left")
+        self.detail_box = ttk.Combobox(
+            meta_row2, textvariable=self.detail_var, state="readonly", width=30,
+            values=["（未细分）"],
+        )
+        self.detail_box.pack(side="left")
+        meta_row3 = tk.Frame(meta, bg=P["card"])
+        meta_row3.pack(fill="x", pady=(8, 0))
+        tk.Label(meta_row3, text="归属材料：", bg=P["card"]).pack(side="left")
+        self.material_box = ttk.Combobox(
+            meta_row3, textvariable=self.material_var, state="readonly", width=22,
+            values=["（无材料）"],
+        )
+        self.material_box.pack(side="left")
+        ttk.Button(meta_row3, text="＋ 新增材料", command=self._open_material_dialog).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(meta_row3, text="编辑材料", command=self._edit_material_dialog).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(meta_row3, text="删除材料", command=self._delete_material).pack(
+            side="left", padx=(6, 0)
+        )
         if self.question and self._qlist and len(self._qlist) > 1:
             nav = tk.Frame(meta, bg=P["card"])
             nav.pack(fill="x", pady=(8, 0))
@@ -99,8 +138,30 @@ class QuestionFormDialog(tk.Toplevel):
         q_frame.pack(fill="both", expand=True, pady=(0, 8))
         tk.Label(q_frame, text="题目内容（可 OCR 识别后核对修改）：", bg=P["card"], fg=P["text"],
                  font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
-        self.question_text = FieldTextArea(q_frame, height=6)
-        self.question_text.pack(fill="both", expand=True, pady=(4, 0))
+        self.q_notebook = ttk.Notebook(q_frame)
+        self.q_notebook.pack(fill="both", expand=True, pady=(4, 0))
+        full_tab = tk.Frame(self.q_notebook, bg=P["card"])
+        self.q_notebook.add(full_tab, text="完整题干")
+        self.question_text = FieldTextArea(full_tab, height=6)
+        self.question_text.pack(fill="both", expand=True)
+        struct_tab = tk.Frame(self.q_notebook, bg=P["card"])
+        self.q_notebook.add(struct_tab, text="结构化字段")
+        struct_tab.columnconfigure(0, weight=1, uniform="struct")
+        struct_tab.columnconfigure(1, weight=1, uniform="struct")
+        struct_tab.columnconfigure(2, weight=1, uniform="struct")
+        struct_tab.rowconfigure(0, weight=1)
+        tk.Label(struct_tab, text="题干", bg=P["card"], fg=P["text"],
+                 font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=0, sticky="nw", padx=(0, 2))
+        tk.Label(struct_tab, text="选项", bg=P["card"], fg=P["text"],
+                 font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=1, sticky="nw", padx=2)
+        tk.Label(struct_tab, text="答案", bg=P["card"], fg=P["text"],
+                 font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=2, sticky="nw", padx=(2, 0))
+        self.stem_text = FieldTextArea(struct_tab, height=5)
+        self.stem_text.grid(row=1, column=0, sticky="nsew", padx=(0, 2))
+        self.options_text = FieldTextArea(struct_tab, height=5)
+        self.options_text.grid(row=1, column=1, sticky="nsew", padx=2)
+        self.answer_text = FieldTextArea(struct_tab, height=5)
+        self.answer_text.grid(row=1, column=2, sticky="nsew", padx=(2, 0))
 
         a_frame = tk.Frame(body, bg=P["card"], padx=12, pady=10,
                            highlightbackground=P["border"], highlightthickness=1)
@@ -139,13 +200,9 @@ class QuestionFormDialog(tk.Toplevel):
         self.img_scroll.pack(fill="both", expand=True, pady=(6, 0))
 
     def _load_initial(self, question, prefill_images, prefill_topic_id):
-        topics = self.db.list_topics(include_disabled=False)
-        self.topic_paths = []
-        self.topic_id_map = {}
-        for t in topics:
-            path = self.db.topic_path(t["id"])
-            self.topic_paths.append(path)
-            self.topic_id_map[path] = t["id"]
+        category_paths = self.db.category_paths()
+        self.topic_paths = [path for path, _ in category_paths]
+        self.topic_id_map = dict(category_paths)
         self.topic_box.configure(values=["（未分类）"] + self.topic_paths)
 
         if question:
@@ -157,8 +214,126 @@ class QuestionFormDialog(tk.Toplevel):
                     self.topic_var.set(path)
             for src in (prefill_images or []):
                 self.images.append({"rel": None, "abs": src, "tk": None, "label": None, "frame": None})
+        self._refresh_meta_options()
+        if self._prefill_detail_type_id:
+            detail_path = self.db.question_type_path(self._prefill_detail_type_id)
+            if detail_path in self.detail_id_map:
+                self.detail_var.set(detail_path)
         self._update_reasons()
         self._render_images()
+
+    def _open_topic_manager(self):
+        from habit_checkin.ui.topic_manager_dialog import TopicManagerDialog
+        current = self.topic_var.get()
+        dlg = TopicManagerDialog(self, self.db)
+        self.wait_window(dlg)
+        category_paths = self.db.category_paths()
+        self.topic_paths = [path for path, _ in category_paths]
+        self.topic_id_map = dict(category_paths)
+        values = ["（未分类）"] + self.topic_paths
+        self.topic_box.configure(values=values)
+        if current not in values:
+            self.topic_var.set("（未分类）")
+        self._refresh_meta_options()
+
+    def _on_topic_selected(self, event=None):
+        self._refresh_meta_options()
+
+    def _refresh_meta_options(self):
+        """按当前科目刷新细分分类与归属材料下拉。"""
+        topic_id = self.topic_id_map.get(self.topic_var.get())
+        old_detail = self.detail_var.get()
+        detail_paths = self.db.detail_type_paths_for_topic(topic_id) if topic_id else []
+        self._detail_options = detail_paths
+        self.detail_id_map = {path: qid for path, qid in detail_paths}
+        values = ["（未细分）"] + [path for path, _ in detail_paths]
+        self.detail_box.configure(values=values)
+        if old_detail in values:
+            self.detail_var.set(old_detail)
+        else:
+            self.detail_var.set("（未细分）")
+
+        materials = self.db.list_question_materials(topic_id=topic_id) if topic_id else []
+        self._material_options = materials
+        self.material_label_map = {}
+        material_values = ["（无材料）"]
+        for m in materials:
+            label = self._material_label(m)
+            base = label
+            idx = 2
+            while label in self.material_label_map:
+                label = "{} #{}".format(base, idx)
+                idx += 1
+            self.material_label_map[label] = m["id"]
+            material_values.append(label)
+        old_material = self.material_var.get()
+        self.material_box.configure(values=material_values)
+        if old_material in material_values:
+            self.material_var.set(old_material)
+        else:
+            self.material_var.set("（无材料）")
+
+    @staticmethod
+    def _material_label(m):
+        kind_labels = {"passage": "材料段落", "table": "表格", "figure": "图表"}
+        title = (m.get("title") or "未命名材料").strip()
+        return "{}（{}）".format(title, kind_labels.get(m.get("kind"), "材料"))
+
+    def _open_material_dialog(self, material=None):
+        topic_id = self.topic_id_map.get(self.topic_var.get())
+        if not topic_id:
+            messagebox.showinfo("材料管理", "请先选择题目所属科目，再管理材料。", parent=self)
+            return
+        from habit_checkin.ui.material_form_dialog import MaterialFormDialog
+        dlg = MaterialFormDialog(
+            self, self.db, material=material,
+            prefill_topic_id=topic_id,
+            prefill_detail_type_id=self._selected_detail_id(),
+            source_item_id=self._source_item_id,
+            detail_paths=self._detail_options,
+            materials=self._material_options,
+        )
+        self.wait_window(dlg)
+        if dlg.saved_material:
+            self._refresh_meta_options()
+            self._select_material(dlg.saved_material["id"])
+
+    def _select_material(self, material_id):
+        for label, mid in self.material_label_map.items():
+            if mid == material_id:
+                self.material_var.set(label)
+                break
+
+    def _edit_material_dialog(self):
+        mid = self._selected_material_id()
+        if not mid:
+            messagebox.showinfo("编辑材料", "请先在「归属材料」中选择要编辑的材料。", parent=self)
+            return
+        material = self.db.get_question_material(mid)
+        if not material:
+            messagebox.showwarning("编辑材料", "所选材料不存在，可能已被删除。", parent=self)
+            return
+        self._open_material_dialog(material=material)
+
+    def _delete_material(self):
+        mid = self._selected_material_id()
+        if not mid:
+            messagebox.showinfo("删除材料", "请先在「归属材料」中选择要删除的材料。", parent=self)
+            return
+        material = self.db.get_question_material(mid)
+        if not material:
+            messagebox.showwarning("删除材料", "所选材料不存在，可能已被删除。", parent=self)
+            return
+        title = (material.get("title") or "未命名材料").strip()
+        if not messagebox.askyesno(
+            "删除材料",
+            "确定删除「{}」吗？\n关联题目会保留，但不再归属该材料。".format(title),
+            parent=self,
+        ):
+            return
+        self.db.delete_question_material(mid)
+        self._refresh_meta_options()
+        self.material_var.set("（无材料）")
 
     def _apply_question(self, q):
         self.question = q
@@ -168,8 +343,25 @@ class QuestionFormDialog(tk.Toplevel):
             self.topic_var.set(path if path in self.topic_id_map else "（未分类）")
         else:
             self.topic_var.set("（未分类）")
+        self._refresh_meta_options()
+        detail_id = q.get("detail_type_id")
+        if detail_id:
+            detail_path = self.db.question_type_path(detail_id)
+            if detail_path in self.detail_id_map:
+                self.detail_var.set(detail_path)
+        material_id = q.get("material_id")
+        if material_id:
+            material = self.db.get_question_material(material_id)
+            if material:
+                self._select_material(material["id"])
         self.question_text.delete("1.0", "end")
         self.question_text.insert("1.0", q["question_text"] or "")
+        self.stem_text.delete("1.0", "end")
+        self.stem_text.insert("1.0", q.get("stem") or "")
+        self.options_text.delete("1.0", "end")
+        self.options_text.insert("1.0", q.get("options") or "")
+        self.answer_text.delete("1.0", "end")
+        self.answer_text.insert("1.0", q.get("answer") or "")
         self.analysis_text.delete("1.0", "end")
         self.analysis_text.insert("1.0", q["analysis"] or "")
         if q["result"]:
@@ -190,19 +382,24 @@ class QuestionFormDialog(tk.Toplevel):
     def _save_current(self):
         if self.question is None:
             return True
-        ok, topic_id = self._checked_topic_id()
+        ok, topic_id, detail_id, material_id = self._checked_meta()
         if not ok:
             return False
         result = {"正确": "correct", "错误": "wrong"}.get(self.result_var.get())
-        self.db.update_question(
-            self.question["id"], topic_id=topic_id,
-            question_text=self.question_text.get("1.0", "end").strip(),
-            analysis=self.analysis_text.get("1.0", "end").strip(),
-            result=result, result_reason=self.reason_var.get().strip(),
-        )
         kept = [im["rel"] for im in self.images if im["rel"]]
         new_sources = [im["abs"] for im in self.images if im["rel"] is None]
-        self.db.sync_question_images(self.question["id"], kept, new_sources)
+        with self.db.transaction():
+            self.db.update_question(
+                self.question["id"], topic_id=topic_id,
+                question_text=self.question_text.get_html().strip(),
+                analysis=self.analysis_text.get_html().strip(),
+                result=result, result_reason=self.reason_var.get().strip(),
+                detail_type_id=detail_id, material_id=material_id,
+                stem=self.stem_text.get_html().strip(),
+                options=self.options_text.get_html().strip(),
+                answer=self.answer_text.get_html().strip(),
+            )
+            self.db.sync_question_images(self.question["id"], kept, new_sources)
         return True
 
     def _switch_question(self, delta):
@@ -249,11 +446,7 @@ class QuestionFormDialog(tk.Toplevel):
     def _append_analysis_ocr(self, text):
         if not text:
             return
-        existing = self.analysis_text.get("1.0", "end").strip()
-        if existing:
-            self.analysis_text.insert("end", "\n" + text)
-        else:
-            self.analysis_text.insert("1.0", text)
+        self.analysis_text.insert("end", text)
         self.ocr_status.configure(text="已识别一段解析，继续框选或完成后处理下一张")
 
     def _update_reasons(self):
@@ -316,9 +509,24 @@ class QuestionFormDialog(tk.Toplevel):
 
     def _add_images(self):
         paths = filedialog.askopenfilenames(parent=self, filetypes=_FILETYPES, title="选择题目图片（可多选）")
+        self._append_images(paths)
+
+    def _append_images(self, paths):
         for p in paths:
             self.images.append({"rel": None, "abs": p, "tk": None, "label": None, "frame": None})
         self._render_images()
+
+    def _on_paste_images(self, event=None):
+        paths, tmp = paste_clipboard_images()
+        if not paths:
+            return
+        self._clipboard_tmp.extend(tmp)
+        self._append_images(paths)
+
+    def _on_destroy_clipboard_cleanup(self, event):
+        if event.widget is self:
+            cleanup_temp_files(self._clipboard_tmp)
+            self._clipboard_tmp = []
 
     def _remove_selected(self):
         if self.selected_index is None:
@@ -377,8 +585,8 @@ class QuestionFormDialog(tk.Toplevel):
             self.ocr_status.configure(text="已填入识别结果，请核对修改")
 
     def _fill(self, widget, text):
-        if widget.get("1.0", "end").strip():
-            widget.insert("end", "\n" + text)
+        if widget.get_plain().strip():
+            widget.insert("end", text)
         else:
             widget.insert("1.0", text)
 
@@ -429,8 +637,8 @@ class QuestionFormDialog(tk.Toplevel):
             self.ocr_status.configure(text="未能结构化（页面排版不规整），已按原版式填入全部文字")
 
     def _smart_format(self):
-        text = self.question_text.get("1.0", "end").strip()
-        ana = self.analysis_text.get("1.0", "end").strip()
+        text = self.question_text.get_plain().strip()
+        ana = self.analysis_text.get_plain().strip()
         if not text and not ana:
             messagebox.showinfo("智能整理", "请先 OCR 识别或输入题目/解析内容。", parent=self)
             return
@@ -580,20 +788,24 @@ class QuestionFormDialog(tk.Toplevel):
             "识别到多道题", "识别到 {} 道图形推理题，是否按题拆分？".format(len(parts)), parent=self
         )
         if ok:
-            ok_topic, topic_id = self._checked_topic_id(require_category=self._source == "checkin")
-            if not ok_topic:
+            ok_meta, topic_id, detail_id, material_id = self._checked_meta()
+            if not ok_meta:
                 return
             img_sources = [im["abs"] if im["rel"] is None else self.db.abs_path(im["rel"]) for im in self.images]
             created = []
-            for q in parts:
-                text = (q["stem"] or "").strip()
-                qid = self.db.add_question(topic_id=topic_id, question_text=text,
-                                           source=self._source, source_item_id=self._source_item_id)
-                srcs = img_sources[:]
-                if q["figure_path"]:
-                    srcs.append(q["figure_path"])
-                self.db.sync_question_images(qid, [], srcs)
-                created.append(qid)
+            with self.db.transaction():
+                for q in parts:
+                    text = (q["stem"] or "").strip()
+                    qid = self.db.add_question(topic_id=topic_id, question_text=text,
+                                               source=self._source, source_item_id=self._source_item_id,
+                                               detail_type_id=detail_id, material_id=material_id,
+                                               stem=text, options=q.get("options") or "",
+                                               answer=q.get("answer") or "")
+                    srcs = img_sources[:]
+                    if q["figure_path"]:
+                        srcs.append(q["figure_path"])
+                    self.db.sync_question_images(qid, [], srcs)
+                    created.append(qid)
             messagebox.showinfo("拆分完成", "已拆分为 {} 道图形推理题。".format(len(created)), parent=self)
             self.saved_question = self.db.get_question(created[0])
             self.destroy()
@@ -614,17 +826,21 @@ class QuestionFormDialog(tk.Toplevel):
         self._render_images()
 
     def _split_into_questions(self, questions):
-        ok_topic, topic_id = self._checked_topic_id(require_category=self._source == "checkin")
-        if not ok_topic:
+        ok_meta, topic_id, detail_id, material_id = self._checked_meta()
+        if not ok_meta:
             return
         sources = [im["abs"] if im["rel"] is None else self.db.abs_path(im["rel"]) for im in self.images]
         created = []
-        for q in questions:
-            text = format_questions_text([q])
-            qid = self.db.add_question(topic_id=topic_id, question_text=text,
-                                       source=self._source, source_item_id=self._source_item_id)
-            self.db.sync_question_images(qid, [], sources)
-            created.append(qid)
+        with self.db.transaction():
+            for q in questions:
+                text = format_questions_text([q])
+                qid = self.db.add_question(topic_id=topic_id, question_text=text,
+                                           source=self._source, source_item_id=self._source_item_id,
+                                           detail_type_id=detail_id, material_id=material_id,
+                                           stem=q.get("stem") or "", options=q.get("options") or "",
+                                           answer=q.get("answer") or "")
+                self.db.sync_question_images(qid, [], sources)
+                created.append(qid)
         messagebox.showinfo(
             "拆分完成", "已将识别内容拆分为 {} 道题，可到题库查看。".format(len(created)), parent=self
         )
@@ -656,27 +872,60 @@ class QuestionFormDialog(tk.Toplevel):
             return False, None
         return True, topic_id
 
+    def _selected_detail_id(self):
+        return self.detail_id_map.get(self.detail_var.get())
+
+    def _selected_material_id(self):
+        return self.material_label_map.get(self.material_var.get())
+
+    def _checked_meta(self):
+        """校验科目/细分/材料，返回 (ok, topic_id, detail_type_id, material_id)。"""
+        ok, topic_id = self._checked_topic_id(require_category=self._source == "checkin")
+        if not ok:
+            return False, None, None, None
+        detail_id = self._selected_detail_id()
+        if self._source == "checkin" and self._detail_options and not detail_id:
+            messagebox.showwarning(
+                "请选择细分分类",
+                "打卡收录的题目需要选择思维导图中的具体分类（如 资料分析 → 单一指标）。\n"
+                "请先在「细分分类」中选择，再保存。",
+                parent=self,
+            )
+            return False, None, None, None
+        return True, topic_id, detail_id, self._selected_material_id()
+
     # ---------- 保存 ----------
     def _save(self):
-        ok_topic, topic_id = self._checked_topic_id(require_category=self._source == "checkin")
-        if not ok_topic:
+        ok, topic_id, detail_id, material_id = self._checked_meta()
+        if not ok:
             return
         result = {"正确": "correct", "错误": "wrong"}.get(self.result_var.get())
         reason = self.reason_var.get().strip()
         fields = {
             "topic_id": topic_id,
-            "question_text": self.question_text.get("1.0", "end").strip(),
-            "analysis": self.analysis_text.get("1.0", "end").strip(),
+            "question_text": self.question_text.get_html().strip(),
+            "analysis": self.analysis_text.get_html().strip(),
             "result": result,
             "result_reason": reason,
+            "detail_type_id": detail_id,
+            "material_id": material_id,
+            "stem": self.stem_text.get_html().strip(),
+            "options": self.options_text.get_html().strip(),
+            "answer": self.answer_text.get_html().strip(),
         }
         if self.question:
-            self.db.update_question(self.question["id"], **fields)
             qid = self.question["id"]
         else:
-            qid = self.db.add_question(source=self._source, source_item_id=self._source_item_id, **fields)
+            qid = None
         kept = [im["rel"] for im in self.images if im["rel"]]
         new_sources = [im["abs"] for im in self.images if im["rel"] is None]
-        self.db.sync_question_images(qid, kept, new_sources)
+        with self.db.transaction():
+            if self.question:
+                self.db.update_question(self.question["id"], **fields)
+            else:
+                qid = self.db.add_question(
+                    source=self._source, source_item_id=self._source_item_id, **fields
+                )
+            self.db.sync_question_images(qid, kept, new_sources)
         self.saved_question = self.db.get_question(qid)
         self.destroy()

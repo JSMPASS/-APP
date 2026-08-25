@@ -7,10 +7,12 @@ from datetime import date
 from tkinter import messagebox, ttk
 
 from habit_checkin.db import validate_date
+from habit_checkin.services.clipboard_utils import bind_entry_undo, bind_text_paste
 from habit_checkin.services.export_common import result_text
 from habit_checkin.ui.calendar import attach_calendar_on_click
-from habit_checkin.ui.common import center_window, setup_styles
+from habit_checkin.ui.common import EmptyState, center_window, setup_styles
 from habit_checkin.ui.field_edit_dialog import FieldTextArea
+from habit_checkin.ui.richtext import to_plain
 from habit_checkin.ui.theme import PALETTE, dialog_header
 from habit_checkin.ui.animate import fade_in
 from habit_checkin.ui.topic_colors import configure_topic_tags, topic_tag
@@ -18,9 +20,9 @@ from habit_checkin.ui.topic_colors import configure_topic_tags, topic_tag
 _COLUMNS = ("code", "topic", "result", "reflected")
 
 def reflected_of(q):
-    return bool((q.get("self_analysis") or "").strip()
-                or (q.get("correct_analysis") or "").strip()
-                or (q.get("reflection") or "").strip())
+    return bool(to_plain(q.get("self_analysis") or "").strip()
+                or to_plain(q.get("correct_analysis") or "").strip()
+                or to_plain(q.get("reflection") or "").strip())
 
 
 class ReflectionWindow(tk.Frame):
@@ -30,6 +32,7 @@ class ReflectionWindow(tk.Frame):
         super().__init__(master, bg=PALETTE["bg"])
         self.db = db
         self._sub_options = []
+        self._empty_state = None
         setup_styles(self)
         self.configure(bg=PALETTE["bg"])
         self._build_ui()
@@ -45,12 +48,16 @@ class ReflectionWindow(tk.Frame):
         top.pack(fill="x")
         tk.Label(top, text="开始日期：", bg=P["bg"]).pack(side="left")
         self.start_entry = ttk.Entry(top, width=11)
+        bind_text_paste(self.start_entry)
         self.start_entry.insert(0, date.today().isoformat())
+        bind_entry_undo(self.start_entry)
         self.start_entry.pack(side="left", padx=(0, 8))
         attach_calendar_on_click(self.start_entry, lambda ds: self._set_entry(self.start_entry, ds))
         tk.Label(top, text="结束日期：", bg=P["bg"]).pack(side="left")
         self.end_entry = ttk.Entry(top, width=11)
+        bind_text_paste(self.end_entry)
         self.end_entry.insert(0, date.today().isoformat())
+        bind_entry_undo(self.end_entry)
         self.end_entry.pack(side="left", padx=(0, 8))
         attach_calendar_on_click(self.end_entry, lambda ds: self._set_entry(self.end_entry, ds))
         tk.Label(top, text="科目：", bg=P["bg"]).pack(side="left")
@@ -68,6 +75,7 @@ class ReflectionWindow(tk.Frame):
             values=["全部细分"],
         )
         self.sub_filter_box.pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="管理科目", command=self._open_topic_manager).pack(side="left", padx=(0, 8))
         self.filter_box.bind("<<ComboboxSelected>>", self._on_root_change)
         ttk.Button(top, text="查询", command=self._query).pack(side="left")
         ttk.Button(top, text="开始复盘", style="Accent.TButton",
@@ -80,9 +88,9 @@ class ReflectionWindow(tk.Frame):
 
         list_frame = tk.Frame(self, bg=P["bg"], padx=14, pady=10)
         list_frame.pack(fill="both", expand=True)
-        box = tk.Frame(list_frame, bg=P["card"], highlightbackground=P["border"], highlightthickness=1)
-        box.pack(fill="both", expand=True)
-        self.tree = ttk.Treeview(box, columns=_COLUMNS, show="headings", selectmode="browse")
+        self.box = tk.Frame(list_frame, bg=P["card"], highlightbackground=P["border"], highlightthickness=1)
+        self.box.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(self.box, columns=_COLUMNS, show="headings", selectmode="browse")
         for col, txt, width, anchor in (
             ("code", "编号", 90, "center"),
             ("topic", "分类", 330, "w"),
@@ -93,7 +101,7 @@ class ReflectionWindow(tk.Frame):
             self.tree.column(col, width=width, anchor=anchor)
         self.tree.tag_configure("done", foreground=PALETTE["done"])
         self.tree.tag_configure("todo", foreground=PALETTE["text"])
-        vsb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(self.box, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -103,6 +111,22 @@ class ReflectionWindow(tk.Frame):
     def _set_entry(entry, ds):
         entry.delete(0, "end")
         entry.insert(0, ds)
+
+    def _open_topic_manager(self):
+        from habit_checkin.ui.topic_manager_dialog import TopicManagerDialog
+        current_root = self.filter_var.get()
+        current_sub = self.sub_filter_var.get()
+        dlg = TopicManagerDialog(self, self.db)
+        self.wait_window(dlg)
+        root_values = ["全部"] + [r["name"] for r in self.db.root_topics()]
+        self.filter_box.configure(values=root_values)
+        if current_root not in root_values:
+            self.filter_var.set("全部")
+        self._on_root_change()
+        valid_subs = ["全部细分"] + [p for p, _ in getattr(self, "_sub_options", [])]
+        if current_sub and current_sub != "全部细分" and current_sub in valid_subs:
+            self.sub_filter_var.set(current_sub)
+        self._query()
 
     def _on_root_change(self, event=None):
         """科目变化时刷新细分下拉框。"""
@@ -178,12 +202,41 @@ class ReflectionWindow(tk.Frame):
             row_tags = (bg_tag, tag) if bg_tag else (tag,)
             self.tree.insert("", "end", iid=str(it["id"]), tags=row_tags,
                              values=(it["code"], it["topic_path"], result_text(it), st))
+        if items:
+            self._hide_empty_state()
+        else:
+            self._show_empty_state()
         correct = sum(1 for it in items if it["result"] == "correct")
         wrong = sum(1 for it in items if it["result"] == "wrong")
         und = len(items) - correct - wrong
         self.summary.configure(
             text="{} 至 {}：共 {} 题（正确 {} · 错误 {} · 未判定 {}），已复盘 {} 题。"
                  "双击或点「开始复盘」逐题复盘。".format(start, end, len(items), correct, wrong, und, done_cnt))
+
+    def _show_empty_state(self):
+        self._hide_empty_state()
+        self._empty_state = EmptyState(
+            self.box,
+            title="这个时间段还没有题目",
+            description="复盘页会列出所选日期内做过的全部题目。\n"
+                        "可以先调整日期范围，或去题库录入、打卡收录题目。",
+            action_text="去题库添加题目",
+            command=self._open_bank,
+        )
+        self._empty_state.place_in(self.box)
+
+    def _hide_empty_state(self):
+        if self._empty_state is not None:
+            try:
+                self._empty_state.destroy()
+            except tk.TclError:
+                pass
+            self._empty_state = None
+
+    def _open_bank(self):
+        root = self.winfo_toplevel()
+        if hasattr(root, "show_page"):
+            root.show_page("bank")
 
     def _reflect(self):
         sel = self.tree.selection()
@@ -234,13 +287,15 @@ class ReflectionFormDialog(tk.Toplevel):
         self.topic_box = ttk.Combobox(topic_row, textvariable=self.topic_var,
                                       state="readonly", width=42)
         self.topic_box.pack(side="left", fill="x", expand=True)
+        ttk.Button(topic_row, text="管理科目", command=self._open_topic_manager).pack(side="left", padx=(6, 0))
         self._category_paths = self.db.category_paths()
         self.topic_box.configure(values=[p for p, _ in self._category_paths])
         cur_path = self.db.topic_path(question["topic_id"]) if question.get("topic_id") else ""
         self.topic_var.set(cur_path if cur_path in [p for p, _ in self._category_paths]
                            else "（请选择具体分类）")
-        if question["question_text"]:
-            tk.Label(head, text="题目：" + question["question_text"][:160],
+        question_preview = to_plain(question.get("question_text") or "").strip()
+        if question_preview:
+            tk.Label(head, text="题目：" + question_preview[:160],
                      bg=P["card"], fg=P["muted"], font=("Microsoft YaHei UI", 11),
                      wraplength=620, justify="left").pack(anchor="w", pady=(2, 0))
 
@@ -265,8 +320,18 @@ class ReflectionFormDialog(tk.Toplevel):
         ttk.Button(bottom, text="保存复盘", style="Accent.TButton",
                    command=self._save).pack(side="right", padx=8)
 
+    def _open_topic_manager(self):
+        from habit_checkin.ui.topic_manager_dialog import TopicManagerDialog
+        current = self.topic_var.get()
+        dlg = TopicManagerDialog(self, self.db)
+        self.wait_window(dlg)
+        self._category_paths = self.db.category_paths()
+        self.topic_box.configure(values=[p for p, _ in self._category_paths])
+        if current not in [p for p, _ in self._category_paths]:
+            self.topic_var.set("（请选择具体分类）")
+
     def _save(self):
-        data = {k: v.get("1.0", "end").strip() for k, v in self.fields.items()}
+        data = {k: v.get_html().strip() for k, v in self.fields.items()}
         if not any(data.values()):
             messagebox.showwarning("保存复盘", "请至少填写一个维度的内容。", parent=self)
             return

@@ -440,8 +440,23 @@ def _parse_tasks(text):
     return {k: v for k, v in tasks.items() if v}
 
 
-def import_plan_document(db, path, overwrite=True):
-    """把模板文档同步到数据库：更新开始日期并重建文档中列出的每日计划。"""
+def _plan_day_has_data(db, plan_id):
+    """判断某天的计划是否有已打卡、总结、图片或计时等真实内容。"""
+    for it in db.get_plan_items(plan_id):
+        if it.get("done") or (it.get("note") or "").strip() or \
+                (it.get("basic_knowledge") or "").strip() or \
+                (it.get("material") or "").strip() or it.get("images") or \
+                it.get("elapsed_seconds"):
+            return True
+    return False
+
+
+def import_plan_document(db, path, overwrite=False):
+    """把模板文档同步到数据库：更新开始日期并重建文档中列出的每日计划。
+
+    默认不覆盖已有计划；overwrite=True 时仍会保留已完成/已有内容的打卡日，
+    只重建空白日期，避免重新导入模板时丢失用户数据。
+    """
     text = read_document_text(path)
     start = _parse_date(text)
     if start is None:
@@ -451,9 +466,10 @@ def import_plan_document(db, path, overwrite=True):
         # 只有开始日期时，至少更新 plan_start_date，不重建计划
         db.set_setting("plan_start_date", start.isoformat())
         db.set_setting("plan_source_file", db.rel_path(path))
-        return {"start": start.isoformat(), "days": 0, "items": 0, "updated_start_only": True}
+        return {"start": start.isoformat(), "days": 0, "items": 0,
+                "skipped_days": 0, "skipped_items": 0, "updated_start_only": True}
 
-    created_days = created_items = 0
+    created_days = created_items = skipped_days = skipped_items = 0
     for day_str, rows in tasks.items():
         try:
             d = date.fromisoformat(day_str)
@@ -464,7 +480,9 @@ def import_plan_document(db, path, overwrite=True):
             continue
         existing = db.get_plan(day_str)
         if existing:
-            if not overwrite:
+            if not overwrite or _plan_day_has_data(db, existing["id"]):
+                skipped_days += 1
+                skipped_items += len(db.get_plan_items(existing["id"]))
                 continue
             db.delete_plan(existing["id"])
         plan_id = db.create_plan(day_str, title="第 {} 天 · 导入计划".format(day_no))
@@ -482,4 +500,6 @@ def import_plan_document(db, path, overwrite=True):
         created_days += 1
     db.set_setting("plan_start_date", start.isoformat())
     db.set_setting("plan_source_file", db.rel_path(path))
-    return {"start": start.isoformat(), "days": created_days, "items": created_items, "updated_start_only": False}
+    return {"start": start.isoformat(), "days": created_days, "items": created_items,
+            "skipped_days": skipped_days, "skipped_items": skipped_items,
+            "updated_start_only": False}

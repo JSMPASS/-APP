@@ -249,6 +249,140 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(q["question_text"], "保留到未分类")
         self.assertEqual(len(self.db.list_topics(include_disabled=True)), 30)
 
+    def test_delete_child_topic_cascades_mindmap_and_knowledge_branch(self):
+        root = self.db.add_topic("联动根科目")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        root_node = next(
+            n for n in self.db.question_types_by_map(m["id"])
+            if n["parent_id"] is None
+        )
+        child = self.db.add_topic("联动子分类", parent_id=root)
+        grand = self.db.add_topic("联动孙级", parent_id=child)
+        child_node = self.db.conn.execute(
+            "SELECT id FROM question_types WHERE map_id=? AND topic_id=?",
+            (m["id"], child),
+        ).fetchone()
+        self.db.add_question_type_full(
+            "导图手子", parent_id=child_node["id"], map_id=m["id"])
+        kept_node = self.db.add_question_type_full(
+            "留存节点", parent_id=root_node["id"], map_id=m["id"])
+        self.assertEqual(len(self.db.list_knowledge_docs(topic_id=child)), 1)
+        self.assertEqual(len(self.db.list_knowledge_docs(topic_id=grand)), 1)
+
+        self.db.delete_topic_cascade(child)
+
+        self.assertIsNone(self.db.conn.execute(
+            "SELECT 1 FROM topics WHERE id IN (?,?)", (child, grand)
+        ).fetchone())
+        self.assertEqual(self.db.conn.execute(
+            "SELECT COUNT(*) AS n FROM question_types "
+            "WHERE map_id=? AND topic_id IN (?,?)",
+            (m["id"], child, grand),
+        ).fetchone()["n"], 0)
+        self.assertIsNone(self.db.conn.execute(
+            "SELECT 1 FROM question_types WHERE parent_id=?", (child_node["id"],)
+        ).fetchone())
+        self.assertEqual(self.db.list_knowledge_docs(topic_id=child), [])
+        self.assertEqual(self.db.list_knowledge_docs(topic_id=grand), [])
+        self.assertEqual(len(self.db.question_types_by_map(m["id"])), 2)
+        self.assertIsNotNone(self.db.get_question_type(root_node["id"]))
+        self.assertIsNotNone(self.db.get_question_type(kept_node))
+
+    def test_delete_topic_cascade_clears_detail_type_refs(self):
+        root = self.db.add_topic("分类清理根")
+        child = self.db.add_topic("分类清理子", parent_id=root)
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        node = self.db.conn.execute(
+            "SELECT id FROM question_types WHERE map_id=? AND topic_id=?",
+            (m["id"], child),
+        ).fetchone()
+        manual = self.db.add_question_type_full(
+            "手工细分", parent_id=node["id"], map_id=m["id"])
+        qid = self.db.add_question(
+            topic_id=child, question_text="保留题目", detail_type_id=manual)
+        mid = self.db.add_question_material(
+            topic_id=child, detail_type_id=manual, title="保留材料")
+
+        self.db.delete_topic_cascade(root)
+
+        self.assertIsNone(self.db.get_question(qid)["detail_type_id"])
+        self.assertIsNone(self.db.get_question_material(mid)["detail_type_id"])
+
+    def test_rename_question_type_syncs_topic_and_knowledge(self):
+        root = self.db.add_topic("重命名根科目")
+        child = self.db.add_topic("重命名子分类", parent_id=root)
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        node = self.db.conn.execute(
+            "SELECT id FROM question_types WHERE map_id=? AND topic_id=?",
+            (m["id"], child),
+        ).fetchone()
+
+        self.db.rename_question_type_with_sync(node["id"], "新分类名")
+
+        self.assertEqual(self.db.get_topic(child)["name"], "新分类名")
+        self.assertEqual(self.db.get_question_type(node["id"])["name"], "新分类名")
+        self.assertEqual(
+            self.db.list_knowledge_docs(topic_id=child)[0]["title"], "新分类名")
+
+    def test_delete_unlinked_question_type_clears_detail_refs(self):
+        root = self.db.add_topic("孤立清理根")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        root_node = next(
+            n for n in self.db.question_types_by_map(m["id"])
+            if n["parent_id"] is None
+        )
+        node = self.db.add_question_type_full(
+            "孤立节点", parent_id=root_node["id"], map_id=m["id"])
+        child = self.db.add_question_type_full(
+            "孤立子节点", parent_id=node, map_id=m["id"])
+        qid = self.db.add_question(
+            topic_id=self._leaf("资料分析")["id"],
+            question_text="保留题目", detail_type_id=child,
+        )
+
+        self.db.delete_question_type_with_sync(node)
+
+        self.assertIsNone(self.db.get_question_type(child))
+        self.assertIsNone(self.db.get_question(qid)["detail_type_id"])
+
+    def test_add_synced_question_type_creates_all_in_one(self):
+        root = self.db.add_topic("联动新增根")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        root_node = next(
+            n for n in self.db.question_types_by_map(m["id"])
+            if n["parent_id"] is None
+        )
+
+        qid, tid = self.db.add_synced_question_type(
+            "联动新增节点", parent_id=root_node["id"], map_id=m["id"],
+            node_type="type",
+        )
+
+        topic = self.db.get_topic(tid)
+        self.assertEqual(topic["name"], "联动新增节点")
+        self.assertEqual(topic["parent_id"], root)
+        self.assertEqual(topic["kind"], "category")
+        self.assertEqual(len(self.db.list_knowledge_docs(topic_id=tid)), 1)
+        node = self.db.get_question_type(qid)
+        self.assertEqual(node["topic_id"], tid)
+        self.assertEqual(node["parent_id"], root_node["id"])
+
+    def test_delete_root_topic_removes_knowledge_images(self):
+        from PIL import Image
+        root = self.db.add_topic("知识清理根科目")
+        child = self.db.add_topic("知识清理子分类", parent_id=root)
+        src = self.root / "knowledge_cascade.png"
+        Image.new("RGB", (40, 40), "blue").save(src)
+        rel = self.db.store_image_from_path(str(src))
+        doc = self.db.list_knowledge_docs(topic_id=child)[0]
+        self.db.add_knowledge_block(
+            doc["id"], "正文块", "<p image='{}'></p>".format(rel))
+
+        self.db.delete_topic_cascade(root)
+
+        self.assertEqual(self.db.list_knowledge_docs(topic_id=child), [])
+        self.assertFalse(Path(self.db.abs_path(rel)).exists())
+
     def test_settings(self):
         self.assertTrue(self.db.get_bool_setting("sound_enabled", True))
         self.db.set_setting("sound_enabled", "0")
@@ -330,6 +464,51 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue(Path(self.db.abs_path(imgs[0]["file_path"])).exists())
         imgs = self.db.sync_question_images(qid, [], [])
         self.assertEqual(imgs, [])
+
+    def test_clear_questions(self):
+        from PIL import Image
+        zl = self._leaf("单一指标")
+        mid = self.db.add_question_material(
+            topic_id=zl["id"], kind="passage", title="保留材料", content="正文")
+        qid = self.db.add_question(
+            topic_id=zl["id"], question_text="待清空", material_id=mid, result="wrong")
+        img = self.root / "qi_clear.png"
+        Image.new("RGB", (30, 30)).save(img)
+        imgs = self.db.sync_question_images(qid, [], [str(img)])
+        rel = imgs[0]["file_path"]
+        self.assertTrue(Path(self.db.abs_path(rel)).exists())
+
+        self.db.clear_questions()
+
+        self.assertEqual(self.db.list_questions(), [])
+        self.assertEqual(self.db.get_question_images(qid), [])
+        self.assertFalse(Path(self.db.abs_path(rel)).exists())
+        self.assertEqual(self.db.next_question_code(), "Q0001")
+        self.assertIsNotNone(self.db.get_question_material(mid))
+        self.assertTrue(any(t["name"] == "单一指标" for t in self.db.list_topics()))
+
+    def test_question_subtree_stats_by_map(self):
+        root = self.db.add_topic("统计根")
+        cat = self.db.add_topic("统计分类", parent_id=root)
+        leaf = self.db.add_topic("统计细分", parent_id=cat)
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        root_node = next(
+            n for n in self.db.question_types_by_map(m["id"]) if n["parent_id"] is None)
+        child_a = self.db.add_question_type_full(
+            "子节点A", parent_id=root_node["id"], map_id=m["id"], topic_id=cat)
+        child_b = self.db.add_question_type_full(
+            "子节点B", parent_id=root_node["id"], map_id=m["id"], topic_id=cat)
+        grandchild = self.db.add_question_type_full(
+            "孙节点", parent_id=child_a, map_id=m["id"], topic_id=leaf)
+
+        self.db.add_question(topic_id=cat, question_text="分类题", result="wrong")
+        self.db.add_question(topic_id=leaf, question_text="细分题", result="correct")
+
+        stats = self.db.question_subtree_stats_by_map(m["id"])
+        self.assertEqual(stats[root_node["id"]], (2, 1))
+        self.assertEqual(stats[child_a], (2, 1))
+        self.assertEqual(stats[child_b], (1, 1))
+        self.assertEqual(stats[grandchild], (1, 0))
 
     def test_metrics(self):
         values = self.db.metric_values()
@@ -468,6 +647,372 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue(all(n["collapsed"] for n in self.db.question_types_by_map(m["id"])))
         self.db.set_question_types_collapsed(m["id"], 0)
         self.assertTrue(all(not n["collapsed"] for n in self.db.question_types_by_map(m["id"])))
+
+    def test_question_materials_crud_and_question_link(self):
+        from PIL import Image
+        zl = self._leaf("资料分析")
+        mid = self.db.add_question_material(
+            topic_id=zl["id"], kind="passage",
+            title="2026 第一篇材料", content="材料正文")
+        self.assertEqual([m["id"] for m in self.db.list_question_materials(topic_id=zl["id"])], [mid])
+        img_path = self.root / "mat.png"
+        Image.new("RGB", (30, 30)).save(img_path)
+        self.db.sync_question_material_images(mid, [], [str(img_path)])
+        mat = self.db.get_question_material(mid)
+        self.assertEqual(len(mat["images"]), 1)
+        self.db.update_question_material(mid, title="新标题", kind="table")
+        mat = self.db.get_question_material(mid)
+        self.assertEqual(mat["title"], "新标题")
+        self.assertEqual(mat["kind"], "table")
+
+        qid = self.db.add_question(
+            topic_id=self._leaf("单一指标")["id"], question_text="Q",
+            material_id=mid, stem="题干", options="A 正确\nB 错误", answer="A",
+        )
+        q = self.db.get_question(qid)
+        self.assertEqual(q["material_title"], "新标题")
+        self.assertEqual(q["stem"], "题干")
+        qrows = self.db.list_questions(material_id=mid)
+        self.assertEqual(len(qrows), 1)
+        self.assertEqual(qrows[0]["material_title"], "新标题")
+
+        rel = mat["images"][0]["file_path"]
+        self.db.delete_question_material(mid)
+        self.assertIsNone(self.db.get_question_material(mid))
+        self.assertIsNone(self.db.get_question(qid)["material_id"])
+        self.assertFalse(Path(self.db.abs_path(rel)).exists())
+
+    def test_question_detail_type_fields_and_filter(self):
+        zl = self._leaf("资料分析")
+        paths = dict(self.db.detail_type_paths_for_topic(zl["id"]))
+        single = next(
+            (qid for path, qid in paths.items() if path.endswith("/ 单一指标")),
+            None,
+        )
+        self.assertIsNotNone(single)
+        self.assertTrue(all(p.startswith("行测 / 资料分析 /") for p in paths))
+        self.assertNotIn("行测 / 资料分析", paths)
+        self.assertEqual(self.db.detail_type_paths_for_topic(self._leaf("自由补弱")["id"]), [])
+
+        qid = self.db.add_question(
+            topic_id=self._leaf("单一指标")["id"], question_text="细分题",
+            detail_type_id=single, stem="提问", answer="B",
+        )
+        q = self.db.get_question(qid)
+        self.assertEqual(q["detail_type_id"], single)
+        self.assertTrue(q["detail_type_name"].endswith("单一指标"))
+        qrows = self.db.list_questions(detail_type_id=single)
+        self.assertEqual(len(qrows), 1)
+        self.assertTrue(qrows[0]["detail_type_name"].endswith("单一指标"))
+
+        extra = self.db.add_question_type_full(
+            "细分子类", parent_id=single, map_id=next(
+                x for x in self.db.list_question_maps() if x["subject_name"] == "行测"
+            )["id"],
+        )
+        self.assertEqual(
+            len(self.db.list_questions(detail_type_id=single)),
+            1,
+        )
+        self.db.delete_question_type(extra)
+
+    def test_sync_checkin_images_with_purpose_and_group(self):
+        from PIL import Image
+        pid = self.db.create_plan("2026-08-21")
+        iid = self.db.add_plan_item(pid, self._leaf("单一指标")["id"])
+        mat, know, q = (self.root / "mat.png", self.root / "know.png", self.root / "q.png")
+        for p in (mat, know, q):
+            Image.new("RGB", (30, 30)).save(p)
+        rel_mat = self.db.store_image_from_path(str(mat))
+        self.db.add_image(iid, rel_mat, sort_order=0)
+        imgs = self.db.sync_checkin_images_with_purpose(iid, [
+            (rel_mat, "material", "mat-1"),
+            (str(know), "knowledge", ""),
+            (str(q), "question", ""),
+        ])
+        kmap = {im["file_path"]: im for im in imgs}
+        self.assertEqual(kmap[rel_mat]["purpose"], "material")
+        self.assertEqual(kmap[rel_mat]["group_key"], "mat-1")
+        self.assertEqual(
+            {im["purpose"] for im in imgs if im["file_path"] != rel_mat},
+            {"knowledge", "question"},
+        )
+        imgs2 = self.db.sync_checkin_images_with_purpose(iid, [
+            (rel_mat, "material", "mat-2"),
+        ])
+        self.assertEqual(imgs2[0]["group_key"], "mat-2")
+        self.db.sync_checkin_images_with_purpose(iid, [])
+        self.assertFalse(Path(self.db.abs_path(rel_mat)).exists())
+
+    def test_old_schema_migration_adds_new_columns(self):
+        import sqlite3
+        old_db = self.root / "old.db"
+        conn = sqlite3.connect(str(old_db))
+        conn.executescript("""
+        CREATE TABLE topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_id INTEGER REFERENCES topics(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            is_preset INTEGER NOT NULL DEFAULT 0,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE plan_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+            topic_id INTEGER NOT NULL REFERENCES topics(id),
+            reminder_time TEXT,
+            done INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            checked_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE checkin_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_item_id INTEGER NOT NULL REFERENCES plan_items(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            topic_id INTEGER REFERENCES topics(id),
+            source TEXT NOT NULL DEFAULT 'manual',
+            source_item_id INTEGER,
+            question_text TEXT NOT NULL DEFAULT '',
+            analysis TEXT NOT NULL DEFAULT '',
+            result TEXT,
+            result_reason TEXT NOT NULL DEFAULT '',
+            self_analysis TEXT NOT NULL DEFAULT '',
+            correct_analysis TEXT NOT NULL DEFAULT '',
+            reflection TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO questions(id, code, question_text, created_at)
+        VALUES (1, 'Q0001', '旧题', '2026-01-01 00:00:00');
+        """)
+        conn.commit()
+        conn.close()
+        db2 = Database(old_db, self.root / "images2", self.root)
+        qcols = {r[1] for r in db2.conn.execute("PRAGMA table_info(questions)").fetchall()}
+        icols = {r[1] for r in db2.conn.execute("PRAGMA table_info(checkin_images)").fetchall()}
+        for col in ("material_id", "detail_type_id", "stem", "options", "answer"):
+            self.assertIn(col, qcols)
+        for col in ("purpose", "group_key"):
+            self.assertIn(col, icols)
+        self.assertIsNone(db2.get_question(1)["detail_type_id"])
+        db2.close()
+
+    def test_store_image_pil_and_path(self):
+        from PIL import Image
+        src = self.root / "src_kb.png"
+        Image.new("RGB", (60, 40), (0, 128, 255)).save(src)
+        rel = self.db.store_image(str(src))
+        self.assertTrue(Path(self.db.abs_path(rel)).is_file())
+        pil = Image.new("RGBA", (20, 20), (255, 0, 0, 128))
+        rel2 = self.db.store_image(pil)
+        self.assertTrue(Path(self.db.abs_path(rel2)).is_file())
+        self.assertTrue(rel2.lower().endswith(".png"))
+
+    def test_knowledge_block_image_cleanup(self):
+        from PIL import Image
+        src1 = self.root / "kb1.png"
+        src2 = self.root / "kb2.png"
+        Image.new("RGB", (30, 30), "red").save(src1)
+        Image.new("RGB", (30, 30), "blue").save(src2)
+        rel1 = self.db.store_image_from_path(str(src1))
+        rel2 = self.db.store_image_from_path(str(src2))
+        doc_id = self.db.add_knowledge_doc("清理文档")
+        block1 = self.db.add_knowledge_block(doc_id, "块1", "<p image='{}'></p>".format(rel1))
+        block2 = self.db.add_knowledge_block(doc_id, "块2", "<p image='{}'></p>".format(rel2))
+        self.assertTrue(Path(self.db.abs_path(rel1)).exists())
+        self.assertTrue(Path(self.db.abs_path(rel2)).exists())
+        self.db.delete_knowledge_block(block2)
+        self.assertFalse(Path(self.db.abs_path(rel2)).exists())
+        self.assertTrue(Path(self.db.abs_path(rel1)).exists())
+        block3 = self.db.add_knowledge_block(doc_id, "块3", "<p image='{}'></p>".format(rel1))
+        self.db.delete_knowledge_block(block3)
+        self.assertTrue(Path(self.db.abs_path(rel1)).exists())
+
+    def test_update_and_delete_knowledge_doc_image_cleanup(self):
+        from PIL import Image
+        src1 = self.root / "upd1.png"
+        src2 = self.root / "upd2.png"
+        Image.new("RGB", (30, 30), "green").save(src1)
+        Image.new("RGB", (30, 30), "black").save(src2)
+        rel1 = self.db.store_image_from_path(str(src1))
+        rel2 = self.db.store_image_from_path(str(src2))
+        doc_id = self.db.add_knowledge_doc("更新文档")
+        block_id = self.db.add_knowledge_block(doc_id, "块", "<p image='{}'></p>".format(rel1))
+        self.db.update_knowledge_block(block_id, content="<p image='{}'></p>".format(rel2))
+        self.assertFalse(Path(self.db.abs_path(rel1)).exists())
+        self.assertTrue(Path(self.db.abs_path(rel2)).exists())
+        doc2 = self.db.add_knowledge_doc("共享文档")
+        self.db.add_knowledge_block(doc2, "共享块", "<p image='{}'></p>".format(rel2))
+        self.db.delete_knowledge_doc(doc_id)
+        self.assertTrue(Path(self.db.abs_path(rel2)).exists())
+        self.db.delete_knowledge_doc(doc2)
+        self.assertFalse(Path(self.db.abs_path(rel2)).exists())
+
+    def test_rename_topic_syncs_mindmap_nodes(self):
+        tid = self._leaf("单一指标")["id"]
+        self.db.rename_topic(tid, "单一指标（新）")
+        rows = self.db.conn.execute(
+            "SELECT name FROM question_types WHERE topic_id=?", (tid,)
+        ).fetchall()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertEqual(r["name"], "单一指标（新）")
+        self.assertEqual(
+            self.db.topic_path(tid),
+            "行测 / 资料分析 / 单一指标（新）",
+        )
+
+    def test_rename_root_topic_syncs_map_and_root_node(self):
+        tid = self._leaf("行测")["id"]
+        self.db.rename_topic(tid, "行政职业能力测验")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == tid)
+        self.assertEqual(m["subject_name"], "行政职业能力测验")
+        root = self.db.conn.execute(
+            "SELECT name FROM question_types WHERE map_id=? AND parent_id IS NULL",
+            (m["id"],),
+        ).fetchone()
+        self.assertEqual(root["name"], "行政职业能力测验")
+
+    def test_add_category_child_syncs_mindmap_and_knowledge(self):
+        root = self.db.add_topic("同步根科目")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        root_node = [n for n in self.db.question_types_by_map(m["id"])
+                     if n["parent_id"] is None][0]
+        child = self.db.add_topic("同步分类子节点", parent_id=root)
+        nodes = {n["topic_id"]: n for n in self.db.question_types_by_map(m["id"])
+                 if n.get("topic_id") is not None}
+        self.assertIn(child, nodes)
+        self.assertEqual(nodes[child]["name"], "同步分类子节点")
+        self.assertEqual(nodes[child]["parent_id"], root_node["id"])
+        docs = self.db.list_knowledge_docs(topic_id=child)
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0]["title"], "同步分类子节点")
+
+    def test_add_child_promotes_parent_node_type(self):
+        root = self.db.add_topic("类型提升根")
+        parent = self.db.add_topic("中间分类", parent_id=root)
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        parent_node = self.db.conn.execute(
+            "SELECT node_type FROM question_types WHERE map_id=? AND topic_id=?",
+            (m["id"], parent),
+        ).fetchone()
+        self.assertEqual(parent_node["node_type"], "type")
+        self.db.add_topic("叶子子项", parent_id=parent)
+        parent_node = self.db.conn.execute(
+            "SELECT node_type FROM question_types WHERE map_id=? AND topic_id=?",
+            (m["id"], parent),
+        ).fetchone()
+        self.assertEqual(parent_node["node_type"], "category")
+
+    def test_add_method_child_does_not_sync_mindmap_or_knowledge(self):
+        root = self.db.add_topic("方法根科目")
+        method = self.db.add_topic("自由补弱", parent_id=root)
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        self.assertFalse(self.db.conn.execute(
+            "SELECT 1 FROM question_types WHERE map_id=? AND topic_id=?",
+            (m["id"], method),
+        ).fetchone())
+        self.assertEqual(self.db.list_knowledge_docs(topic_id=method), [])
+
+    def test_rename_topic_syncs_knowledge_doc_title(self):
+        root = self.db.add_topic("知识同步根")
+        child = self.db.add_topic("旧知识名", parent_id=root)
+        self.db.rename_topic(child, "新知识名")
+        docs = self.db.list_knowledge_docs(topic_id=child)
+        self.assertEqual([d["title"] for d in docs], ["新知识名"])
+
+    def test_set_topic_kind_syncs_switched_category(self):
+        root = self.db.add_topic("切换根")
+        method = self.db.add_topic("自由补弱", parent_id=root)
+        self.db.set_topic_kind(method, "category")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        node = self.db.conn.execute(
+            "SELECT id FROM question_types WHERE map_id=? AND topic_id=?",
+            (m["id"], method),
+        ).fetchone()
+        self.assertIsNotNone(node)
+        self.assertEqual(len(self.db.list_knowledge_docs(topic_id=method)), 1)
+
+    def test_sync_off_mindmap_flow_keeps_manual_node(self):
+        root = self.db.add_topic("手动根")
+        m = next(x for x in self.db.list_question_maps() if x["topic_id"] == root)
+        child = self.db.add_topic("手动子节点", parent_id=root, sync=False)
+        self.assertFalse(self.db.conn.execute(
+            "SELECT 1 FROM question_types WHERE topic_id=?", (child,)
+        ).fetchone())
+        self.db.ensure_topic_knowledge_doc(child)
+        self.assertEqual(len(self.db.list_knowledge_docs(topic_id=child)), 1)
+        # 导图节点仍由调用方显式创建，避免知识库补建时重复插入
+        self.assertEqual(
+            self.db.conn.execute(
+                "SELECT COUNT(*) AS n FROM question_types WHERE topic_id=?", (child,)
+            ).fetchone()["n"],
+            0,
+        )
+
+    def test_create_synced_topic_uses_map_root(self):
+        from habit_checkin.ui.question_type_mindmap_window import create_synced_topic
+        m = next(x for x in self.db.list_question_maps() if x["subject_name"] == "行测")
+        root = self.db.conn.execute(
+            "SELECT id FROM question_types WHERE map_id=? AND parent_id IS NULL",
+            (m["id"],),
+        ).fetchone()
+        tid = create_synced_topic(self.db, "新细分指标", root["id"], m["id"])
+        row = self.db.conn.execute(
+            "SELECT name, kind, parent_id FROM topics WHERE id=?", (tid,)
+        ).fetchone()
+        self.assertEqual(row["name"], "新细分指标")
+        self.assertEqual(row["kind"], "category")
+        self.assertEqual(row["parent_id"], self._leaf("行测")["id"])
+
+    def test_create_synced_topic_uses_linked_parent(self):
+        from habit_checkin.ui.question_type_mindmap_window import create_synced_topic
+        m = next(x for x in self.db.list_question_maps() if x["subject_name"] == "行测")
+        zl = self._leaf("资料分析")
+        qt = self.db.conn.execute(
+            "SELECT id FROM question_types WHERE topic_id=? AND map_id=? LIMIT 1",
+            (zl["id"], m["id"]),
+        ).fetchone()
+        tid = create_synced_topic(self.db, "深层细分", qt["id"], m["id"])
+        parent_id = self.db.conn.execute(
+            "SELECT parent_id FROM topics WHERE id=?", (tid,)
+        ).fetchone()["parent_id"]
+        self.assertEqual(parent_id, zl["id"])
+
+    def test_create_synced_topic_requires_linked_map(self):
+        from habit_checkin.ui.question_type_mindmap_window import create_synced_topic
+        with self.assertRaises(ValueError):
+            create_synced_topic(self.db, "孤立节点", None, 999999)
+
+    def test_create_synced_topic_skips_method_parent(self):
+        from habit_checkin.ui.question_type_mindmap_window import create_synced_topic
+        m = next(x for x in self.db.list_question_maps() if x["subject_name"] == "行测")
+        root = self.db.conn.execute(
+            "SELECT id FROM question_types WHERE map_id=? AND parent_id IS NULL",
+            (m["id"],),
+        ).fetchone()
+        method_tid = self._leaf("自由补弱")["id"]
+        qt_id = self.db.add_question_type_full(
+            "自由补弱", parent_id=root["id"], map_id=m["id"],
+            node_type="type", topic_id=method_tid,
+        )
+        tid = create_synced_topic(self.db, "方法下新节点", qt_id, m["id"])
+        parent_id = self.db.conn.execute(
+            "SELECT parent_id FROM topics WHERE id=?", (tid,)
+        ).fetchone()["parent_id"]
+        self.assertEqual(parent_id, self._leaf("行测")["id"])
 
 
 if __name__ == "__main__":

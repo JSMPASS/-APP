@@ -18,6 +18,7 @@ from habit_checkin.services.export_common import (
     result_text,
     weekday_cn,
 )
+from habit_checkin.ui.richtext import to_plain
 
 W = 1080
 PAD = 44
@@ -295,7 +296,7 @@ def export_image(db, start_date, end_date, out_path):
             elapsed = int(it.get("elapsed_seconds") or 0)
             suffix = " · 学习时长 {}".format(fmt_duration(elapsed)) if elapsed > 0 else ""
             lay.heading("{}（打卡时间 {}{}）".format(it["topic_path"], checked, suffix))
-            note = (it["note"] or "").strip()
+            note = to_plain(it.get("note") or "").strip()
             lay.line("文字总结：{}".format(note or "（未填写）"), size=14,
                      color=C_TEXT if note else C_MUTED)
             for img in images_map.get(it["id"], []):
@@ -309,18 +310,20 @@ def export_image(db, start_date, end_date, out_path):
         lay.section("二、题目与解析（{} 题）".format(len(questions)))
         for q in questions:
             lay.heading("【{}】{}（{}）".format(q["code"], q["topic_path"], result_text(q)))
-            lay.line("题目内容：{}".format(q["question_text"] or "（未填写）"), size=14,
-                     color=C_TEXT if q["question_text"] else C_MUTED)
-            lay.line("解析：{}".format(q["analysis"] or "（未填写）"), size=14,
-                     color=C_TEXT if q["analysis"] else C_MUTED)
+            question_text = to_plain(q.get("question_text") or "").strip()
+            analysis = to_plain(q.get("analysis") or "").strip()
+            lay.line("题目内容：{}".format(question_text or "（未填写）"), size=14,
+                     color=C_TEXT if question_text else C_MUTED)
+            lay.line("解析：{}".format(analysis or "（未填写）"), size=14,
+                     color=C_TEXT if analysis else C_MUTED)
             for img in qimages.get(q["id"], []):
                 abs_path = db.abs_path(img["file_path"])
                 if os.path.isfile(abs_path):
                     lay.image(abs_path)
             filled = bool(
-                (q.get("self_analysis") or "").strip()
-                or (q.get("correct_analysis") or "").strip()
-                or (q.get("reflection") or "").strip()
+                to_plain(q.get("self_analysis") or "").strip()
+                or to_plain(q.get("correct_analysis") or "").strip()
+                or to_plain(q.get("reflection") or "").strip()
             )
             if q["result"] == "wrong" or filled:
                 if not filled:
@@ -332,7 +335,7 @@ def export_image(db, start_date, end_date, out_path):
                         ("正确的做题思路", "correct_analysis"),
                         ("复盘心得", "reflection"),
                     ):
-                        val = (q.get(key) or "").strip()
+                        val = to_plain(q.get(key) or "").strip()
                         lay.line("　{}：{}".format(label, val or "（未填写）"), size=13,
                                  color=C_TEXT if val else C_MUTED)
             lay.spacer(8)

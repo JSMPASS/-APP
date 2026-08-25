@@ -1,6 +1,7 @@
 """服务层单元测试：OCR 空格清理、激励语、打卡图片自动收录。"""
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from habit_checkin.services.collect import collect_image_questions, collect_ques
 from habit_checkin.services.motivation import random_quote
 from habit_checkin.services import ocr as ocr_module
 from habit_checkin.services.ocr import cleanup_cjk_spaces, format_questions_text, parse_ocr_questions, preprocess_for_ocr, reconstruct_page
+from habit_checkin.services.knowledge_split import structured_knowledge_blocks
 from habit_checkin.services import plan_docs
 
 
@@ -55,11 +57,81 @@ class TestOcrPreprocess(unittest.TestCase):
     def test_ocr_image_lines_removes_temp_file(self):
         fake = self.root / "fake_pre.png"
         fake.write_bytes(b"x")
-        with mock.patch.object(ocr_module, "preprocess_for_ocr", return_value=str(fake)), \
+        with mock.patch.dict(
+            "os.environ", {"HABIT_OCR_ENGINE": "winrt"}, clear=False
+        ), mock.patch.object(ocr_module, "preprocess_for_ocr", return_value=str(fake)), \
                 mock.patch.object(ocr_module, "_run_ocr", return_value=[(0, 0, "hello")]):
             lines = ocr_module.ocr_image_lines(str(self.img))
         self.assertEqual(lines, ["hello"])
         self.assertFalse(fake.exists())
+
+    def test_poly_to_xy(self):
+        poly = [(10, 20), (110, 22), (112, 62), (12, 60)]
+        self.assertEqual(ocr_module._poly_to_xy(poly, None), (10, 20))
+        self.assertEqual(ocr_module._poly_to_xy(None, [5, 7]), (5, 7))
+        self.assertEqual(ocr_module._poly_to_xy(None, None), (0, 0))
+
+
+class TestOcrModelRoot(unittest.TestCase):
+    def tearDown(self):
+        ocr_module.set_model_root("")
+
+    def test_default_root_points_to_data_models(self):
+        root = ocr_module.default_model_root()
+        self.assertTrue(root.endswith(str(Path("data") / "models")))
+
+    def test_set_model_root_overrides_resolution(self):
+        ocr_module.set_model_root("D:\\ocr_models")
+        self.assertEqual(ocr_module._resolve_model_root(), "D:\\ocr_models")
+        det, rec, layout = ocr_module._paddle_dirs()[1:]
+        self.assertEqual(det, "D:\\ocr_models\\PP-OCRv5_server_det")
+        self.assertEqual(rec, "D:\\ocr_models\\PP-OCRv5_server_rec")
+        self.assertEqual(layout, "D:\\ocr_models\\PicoDet-S_layout_17cls")
+
+    def test_reset_restores_default(self):
+        ocr_module.set_model_root("D:\\ocr_models")
+        ocr_module.set_model_root("")
+        self.assertEqual(
+            ocr_module._resolve_model_root(), ocr_module.default_model_root()
+        )
+
+    def test_env_var_fallback(self):
+        with mock.patch.dict(
+            "os.environ", {"HABIT_OCR_MODEL_ROOT": "E:\\models"}, clear=False
+        ):
+            self.assertEqual(ocr_module._resolve_model_root(), "E:\\models")
+
+
+class TestOcrDeviceAndEngine(unittest.TestCase):
+    def tearDown(self):
+        ocr_module.set_device("cpu")
+        ocr_module.set_engine("paddle")
+
+    def test_default_device_is_cpu(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(ocr_module._paddle_device(), "cpu")
+
+    def test_set_device_cuda(self):
+        ocr_module.set_device("cuda")
+        self.assertEqual(ocr_module._paddle_device(), "gpu")
+
+    def test_set_device_gpu_alias(self):
+        ocr_module.set_device("gpu")
+        self.assertEqual(ocr_module._paddle_device(), "gpu")
+
+    def test_set_device_cpu_clears_env(self):
+        ocr_module.set_device("cuda")
+        ocr_module.set_device("cpu")
+        self.assertEqual(ocr_module._paddle_device(), "cpu")
+
+    def test_set_engine_winrt(self):
+        ocr_module.set_engine("winrt")
+        self.assertEqual(os.environ.get("HABIT_OCR_ENGINE"), "winrt")
+
+    def test_set_engine_back_to_paddle(self):
+        ocr_module.set_engine("winrt")
+        ocr_module.set_engine("paddle")
+        self.assertNotIn("HABIT_OCR_ENGINE", os.environ)
 
 
 class TestOcrParse(unittest.TestCase):
@@ -137,6 +209,46 @@ class TestReconstruct(unittest.TestCase):
     def test_reconstruct_rejects_nonregular(self):
         lines = ["这是一段普通文字", "没有结构"]
         self.assertIsNone(reconstruct_page(lines))
+
+
+class TestStructuredKnowledgeBlocks(unittest.TestCase):
+    def test_title_text_splits_into_blocks(self):
+        records = [
+            {"label": "paragraph_title", "content": "一、增长率的定义", "order": 1},
+            {"label": "text", "content": "增长率用于衡量数据的增长速度。", "order": 2},
+            {"label": "paragraph_title", "content": "二、增长率的计算", "order": 3},
+            {"label": "text", "content": "增长率 = 现期量 - 基期量。", "order": 4},
+        ]
+        blocks = structured_knowledge_blocks(records)
+        self.assertEqual([b["title"] for b in blocks],
+                         ["一、增长率的定义", "二、增长率的计算"])
+        self.assertIn("增长率用于衡量数据的增长速度", blocks[0]["content"])
+        self.assertIn("<p>", blocks[0]["content"])
+        self.assertNotIn("（页脚）", blocks[0]["content"])
+
+    def test_consecutive_titles_merge_with_bold_heading(self):
+        records = [
+            {"label": "doc_title", "content": "资料分析考点精讲", "order": 1},
+            {"label": "paragraph_title", "content": "同比与环比", "order": 2},
+            {"label": "text", "content": "同比是与去年同期比较。", "order": 3},
+        ]
+        blocks = structured_knowledge_blocks(records)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["title"], "同比与环比")
+        self.assertIn("<b>资料分析考点精讲</b>", blocks[0]["content"])
+        self.assertIn("同比是与去年同期比较", blocks[0]["content"])
+
+    def test_noise_and_empty_records(self):
+        records = [
+            {"label": "header", "content": "页眉", "order": 1},
+            {"label": "number", "content": "12", "order": 2},
+            {"label": "text", "content": "只有一段正文", "order": 3},
+        ]
+        blocks = structured_knowledge_blocks(records)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["title"], "知识点")
+        self.assertNotIn("页眉", blocks[0]["content"])
+        self.assertEqual(structured_knowledge_blocks([]), [])
 
 
 class TestMotivation(unittest.TestCase):
@@ -236,6 +348,58 @@ class TestPlanDocImport(unittest.TestCase):
         result = plan_docs.import_plan_document(self.db, str(md))
         self.assertTrue(result["updated_start_only"])
         self.assertEqual(self.db.get_setting("plan_source_file"), "start.md")
+
+    def test_import_preserves_existing_completed_plan_even_when_overwrite(self):
+        md = self.root / "plan.md"
+        md.write_text(
+            "# 习惯打卡计划模板\n"
+            "- 开始日期：2026-08-01\n"
+            "## 每日任务\n"
+            "### 2026-08-01\n"
+            "- 09:30 | 大作文 | 主 | 写一篇\n",
+            encoding="utf-8",
+        )
+        plan_docs.import_plan_document(self.db, str(md), overwrite=True)
+        pid = self.db.get_plan("2026-08-01")["id"]
+        item = self.db.get_plan_items(pid)[0]
+        self.db.update_checkin(item["id"], note="已完成总结", done=True)
+
+        md2 = self.root / "plan2.md"
+        md2.write_text(
+            "# 习惯打卡计划模板\n"
+            "- 开始日期：2026-08-01\n"
+            "## 每日任务\n"
+            "### 2026-08-01\n"
+            "- 10:00 | 资料分析 | 主 | 改时间\n",
+            encoding="utf-8",
+        )
+        result = plan_docs.import_plan_document(self.db, str(md2), overwrite=True)
+
+        self.assertEqual(result["skipped_days"], 1)
+        self.assertEqual(result["days"], 0)
+        plan = self.db.get_plan("2026-08-01")
+        self.assertIsNotNone(plan)
+        items = self.db.get_plan_items(plan["id"])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["note"], "已完成总结")
+
+    def test_import_default_skips_existing_plan(self):
+        md = self.root / "plan.md"
+        md.write_text(
+            "# 习惯打卡计划模板\n"
+            "- 开始日期：2026-08-02\n"
+            "## 每日任务\n"
+            "### 2026-08-02\n"
+            "- 09:30 | 大作文 | 主 | 写一篇\n",
+            encoding="utf-8",
+        )
+        plan_docs.import_plan_document(self.db, str(md))
+        pid = self.db.get_plan("2026-08-02")["id"]
+
+        result = plan_docs.import_plan_document(self.db, str(md))
+
+        self.assertEqual(result["skipped_days"], 1)
+        self.assertEqual(self.db.get_plan("2026-08-02")["id"], pid)
 
 
 class TestPlanDocMarkdownSync(unittest.TestCase):

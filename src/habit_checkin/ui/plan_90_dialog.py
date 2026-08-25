@@ -8,6 +8,7 @@ import tkinter as tk
 from datetime import date, timedelta
 from tkinter import messagebox, ttk
 
+from habit_checkin.services.clipboard_utils import bind_entry_undo, bind_text_paste
 from habit_checkin.services.study_plan import generate_90day_plan, get_plan_config
 from habit_checkin.ui.animate import fade_in
 from habit_checkin.ui.calendar import attach_calendar_on_click
@@ -40,7 +41,9 @@ class Plan90Dialog(tk.Toplevel):
         row.pack(fill="x")
         tk.Label(row, text="开始日期（第 1 天）：", bg=P["bg"]).pack(side="left")
         self.date_entry = ttk.Entry(row, width=12)
+        bind_text_paste(self.date_entry)
         self.date_entry.insert(0, start)
+        bind_entry_undo(self.date_entry)
         self.date_entry.pack(side="left", padx=(0, 6))
         attach_calendar_on_click(self.date_entry, lambda ds: self._set_date(ds))
         ttk.Button(row, text="今天", command=lambda: self._set_date(date.today().isoformat())).pack(side="left")

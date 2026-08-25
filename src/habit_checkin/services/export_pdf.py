@@ -26,6 +26,7 @@ from habit_checkin.services.export_common import (
     result_text,
     weekday_cn,
 )
+from habit_checkin.ui.richtext import to_plain
 
 _FONT = "STSong-Light"
 
@@ -123,7 +124,7 @@ def export_pdf(db, start_date, end_date, out_path):
                 elapsed = int(it.get("elapsed_seconds") or 0)
                 suffix = " · 学习时长 {}".format(fmt_duration(elapsed)) if elapsed > 0 else ""
                 story.append(Paragraph(_esc("{}（打卡时间 {}{}）".format(it["topic_path"], checked, suffix)), _STYLES["h3"]))
-                note = (it["note"] or "").strip()
+                note = to_plain(it.get("note") or "").strip()
                 story.append(Paragraph("文字总结：" + _esc(note or "（未填写）"), _STYLES["body"]))
                 for img in images_map.get(it["id"], []):
                     _add_image(story, db.abs_path(img["file_path"]), tmpdir)
@@ -136,14 +137,20 @@ def export_pdf(db, start_date, end_date, out_path):
                     "【{}】{}（{}）".format(_esc(q["code"]), _esc(q["topic_path"]), _esc(result_text(q))),
                     _STYLES["h3"],
                 ))
-                story.append(Paragraph("题目内容：" + _esc(q["question_text"] or "（未填写）"), _STYLES["body"]))
-                story.append(Paragraph("解析：" + _esc(q["analysis"] or "（未填写）"), _STYLES["body"]))
+                story.append(Paragraph(
+                    "题目内容：" + _esc(to_plain(q.get("question_text") or "").strip() or "（未填写）"),
+                    _STYLES["body"],
+                ))
+                story.append(Paragraph(
+                    "解析：" + _esc(to_plain(q.get("analysis") or "").strip() or "（未填写）"),
+                    _STYLES["body"],
+                ))
                 for img in qimages.get(q["id"], []):
                     _add_image(story, db.abs_path(img["file_path"]), tmpdir)
                 filled = bool(
-                    (q.get("self_analysis") or "").strip()
-                    or (q.get("correct_analysis") or "").strip()
-                    or (q.get("reflection") or "").strip()
+                    to_plain(q.get("self_analysis") or "").strip()
+                    or to_plain(q.get("correct_analysis") or "").strip()
+                    or to_plain(q.get("reflection") or "").strip()
                 )
                 if q["result"] == "wrong" or filled:
                     if not filled:
@@ -155,7 +162,7 @@ def export_pdf(db, start_date, end_date, out_path):
                             ("正确的做题思路", "correct_analysis"),
                             ("复盘心得", "reflection"),
                         ):
-                            val = (q.get(key) or "").strip()
+                            val = to_plain(q.get(key) or "").strip()
                             story.append(Paragraph(
                                 "　{}：{}".format(label, _esc(val or "（未填写）")), _STYLES["note"]
                             ))

@@ -16,6 +16,7 @@ from habit_checkin.ui.question_type_mindmap_window import (
     _NODE_H,
     _MIN_GAP,
     estimate_node_width,
+    initial_child_pos,
     bezier_curve,
     round_rect_points,
     screen_to_world,
@@ -277,6 +278,50 @@ class TestLayout(unittest.TestCase):
         center = (min(child_tops) + max(child_tops) + _NODE_H) / 2.0
         self.assertAlmostEqual(center, _NODE_H / 2.0, places=6)
 
+    def test_initial_child_pos_places_next_to_parent(self):
+        x, y = initial_child_pos((10, 20, 170, 56), 200, [])
+        self.assertEqual((x, y), (200.0, 20.0))
+
+    def test_initial_child_pos_skips_occupied_slot(self):
+        x, y = initial_child_pos((0, 0, 170, 56), 170, [(190, 0, 170, 56)])
+        self.assertEqual(x, 190.0)
+        self.assertGreaterEqual(y, _NODE_H + _MIN_GAP)
+
+    def test_manual_add_node_places_next_to_parent(self):
+        m = next(
+            x for x in self.db.list_question_maps()
+            if x["subject_name"] == "行测"
+        )
+        root = next(
+            n for n in self.db.question_types_by_map(m["id"])
+            if n["parent_id"] is None
+        )
+        nodes = self.db.question_types_by_map(m["id"])
+        w = self._window_from_nodes(nodes, "logic")
+        w._map["layout_mode"] = "manual"
+        w.db = self.db
+        new_id = self.db.add_question_type_full(
+            "新增子节点", parent_id=root["id"], map_id=m["id"], node_type="type",
+        )
+        w._place_new_node_near_parent({
+            "id": new_id,
+            "parent_id": root["id"],
+            "name": "新增子节点",
+            "node_width": estimate_node_width("新增子节点"),
+            "auto_width": 1,
+        })
+        new_node = self.db.get_question_type(new_id)
+        px, py = w._node_pos[root["id"]]
+        expected_x = px + w._node_width(root) + _MIN_GAP
+        self.assertAlmostEqual(new_node["pos_x"], expected_x, places=6)
+        # 手动布局下仍贴近父节点，不会落到原点或远离父节点的位置
+        self.assertLessEqual(
+            abs(new_node["pos_y"] - py), (_NODE_H + _MIN_GAP) * 6)
+        w._nodes[new_id] = new_node
+        w._children.setdefault(root["id"], []).append(new_node)
+        w._node_pos[new_id] = (new_node["pos_x"], new_node["pos_y"])
+        self._assert_min_gap(w)
+
     def test_logic_symmetric_around_root_center(self):
         """右向逻辑图整体围绕根节点水平中线上下对称。"""
         w, pos = self._layout("logic")
@@ -494,7 +539,7 @@ class TestMindmapExport(unittest.TestCase):
         text = out.read_text(encoding="utf-8")
         self.assertIn("# 行测 题型思维导图", text)
         self.assertIn("- 图推技巧", text)
-        self.assertIn("- 识别方法：看对称", text)
+        self.assertIn("- 识别题型：看对称", text)
         self.assertIn("- 解题思路：先整体后局部", text)
 
     def test_export_missing_map(self):
@@ -637,6 +682,153 @@ class TestMoveQuestionType(unittest.TestCase):
         self.assertEqual(node["pos_y"], 34.0)
         self.db.update_question_type_full(a, free_float=0)
         self.assertEqual(self.db.get_question_type(a)["free_float"], 0)
+
+
+class TestDetailSidebarScrolling(unittest.TestCase):
+    """节点详情侧边栏应可滚动查看溢出 UI 高度的内容（真实 Tk 窗口冒烟测试）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root_dir = Path(self.tmp.name)
+        self.db = Database(root_dir / "app.db", root_dir / "images", root_dir)
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def test_detail_sidebar_scrollable(self):
+        import tkinter as tk
+        from habit_checkin.ui.question_type_mindmap_window import QuestionTypeMindmapWindow
+
+        root = tk.Tk()
+        root.geometry("960x640+-10000+-10000")
+        try:
+            win = QuestionTypeMindmapWindow(root, self.db)
+            win.pack(fill="both", expand=True)
+            win.update_idletasks()
+            root.update_idletasks()
+            # 抽屉动画依赖真实延时，测试里直接同步展开，避免遗留定时回调
+            win._animate_detail = lambda target, ms=140, steps=8, **kwargs: \
+                win.detail_frame.configure(width=target)
+
+            m = next(x for x in self.db.list_question_maps()
+                     if x["subject_name"] == "行测")
+            leaf = next(n for n in self.db.question_types_by_map(m["id"])
+                        if n["name"] == "逻辑填空（选词填空）")
+            win._select_node(leaf["id"])
+            # 推完展开动画与布局计算
+            for _ in range(20):
+                root.update()
+
+            scroll = win.detail_scroll
+            self.assertIsNotNone(scroll.vsb)
+            region = scroll.canvas.cget("scrollregion") or ""
+            parts = [float(x) for x in region.split()]
+            self.assertEqual(len(parts), 4)
+            self.assertGreater(parts[3] - parts[1], 0)  # 内容有实际高度可滚动
+            scroll.canvas.yview_moveto(1.0)
+            top, _ = scroll.canvas.yview()
+            self.assertGreater(top, 0.0)  # 滚动条可把内容滚出可视区
+        finally:
+            root.destroy()
+
+
+class TestDetailSidebarDynamicHeight(unittest.TestCase):
+    """节点详情侧边栏内容应随富文本增多动态增高（真实 Tk 窗口冒烟测试）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root_dir = Path(self.tmp.name)
+        self.db = Database(root_dir / "app.db", root_dir / "images", root_dir)
+
+    def tearDown(self):
+        self.db.close()
+        self.tmp.cleanup()
+
+    def test_detail_fields_grow_with_content(self):
+        import tkinter as tk
+        from habit_checkin.ui.question_type_mindmap_window import QuestionTypeMindmapWindow
+
+        root = tk.Tk()
+        root.geometry("960x640+-10000+-10000")
+        try:
+            win = QuestionTypeMindmapWindow(root, self.db)
+            win.pack(fill="both", expand=True)
+            root.update()
+            win._animate_detail = lambda target, ms=140, steps=8, **kwargs: \
+                win.detail_frame.configure(width=target)
+
+            m = next(x for x in self.db.list_question_maps()
+                     if x["subject_name"] == "行测")
+            leaf = next(n for n in self.db.question_types_by_map(m["id"])
+                        if n["name"] == "逻辑填空（选词填空）")
+            win._select_node(leaf["id"])
+            for _ in range(20):
+                root.update()
+
+            short_editable = int(win.detail_texts["recognition"].text.cget("height"))
+            short_remark = int(win.detail_texts["remark"].text.cget("height"))
+            region_short = [float(x) for x in
+                            (win.detail_scroll.canvas.cget("scrollregion") or "").split()]
+
+            long_text = "<p>{}</p>".format(
+                "随内容增多的完整解题说明。" * 80)
+            win.detail_texts["recognition"].set_html(long_text)
+            win.detail_texts["method"].set_html(long_text)
+            win.detail_texts["remark"].set_html(long_text)
+            for _ in range(30):
+                root.update()
+
+            long_editable = int(win.detail_texts["recognition"].text.cget("height"))
+            long_remark = int(win.detail_texts["remark"].text.cget("height"))
+            region_long = [float(x) for x in
+                           (win.detail_scroll.canvas.cget("scrollregion") or "").split()]
+
+            self.assertGreater(long_editable, short_editable)
+            self.assertGreater(long_remark, short_remark)
+            self.assertGreater(region_long[3] - region_long[1],
+                               region_short[3] - region_short[1])
+        finally:
+            root.destroy()
+
+    def test_detail_fields_keep_growing_beyond_twelve_lines(self):
+        """超过 12 行后仍应继续随内容增高，不能停在固定行数。"""
+        import tkinter as tk
+        from habit_checkin.ui.question_type_mindmap_window import QuestionTypeMindmapWindow
+
+        root = tk.Tk()
+        root.geometry("960x640+-10000+-10000")
+        try:
+            win = QuestionTypeMindmapWindow(root, self.db)
+            win.pack(fill="both", expand=True)
+            root.update()
+            win._animate_detail = lambda target, ms=140, steps=8, **kwargs: \
+                win.detail_frame.configure(width=target)
+
+            m = next(x for x in self.db.list_question_maps()
+                     if x["subject_name"] == "行测")
+            leaf = next(n for n in self.db.question_types_by_map(m["id"])
+                        if n["name"] == "逻辑填空（选词填空）")
+            win._select_node(leaf["id"])
+            for _ in range(20):
+                root.update()
+
+            mid_text = "<p>{}</p>".format("识别与解题说明。" * 18)
+            long_text = "<p>{}</p>".format("识别与解题说明。" * 38)
+            win.detail_texts["recognition"].set_html(mid_text)
+            for _ in range(20):
+                root.update()
+            mid_height = int(win.detail_texts["recognition"].text.cget("height"))
+
+            win.detail_texts["recognition"].set_html(long_text)
+            for _ in range(20):
+                root.update()
+            long_height = int(win.detail_texts["recognition"].text.cget("height"))
+
+            self.assertGreater(long_height, mid_height)
+            self.assertGreaterEqual(long_height, 13)
+        finally:
+            root.destroy()
 
 
 if __name__ == "__main__":

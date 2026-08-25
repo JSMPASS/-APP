@@ -11,14 +11,15 @@ def collect_question_from_image(db, source_path, text, topic_id=None, source_ite
     便于后续在题库中补充题目内容）。
     """
     text = (text or "").strip()
-    qid = db.add_question(
-        topic_id=topic_id,
-        question_text=text,
-        analysis=analysis or "",
-        source="checkin",
-        source_item_id=source_item_id,
-    )
-    db.sync_question_images(qid, [], [source_path])
+    with db.transaction():
+        qid = db.add_question(
+            topic_id=topic_id,
+            question_text=text,
+            analysis=analysis or "",
+            source="checkin",
+            source_item_id=source_item_id,
+        )
+        db.sync_question_images(qid, [], [source_path])
     q = db.get_question(qid)
     return q["code"], text
 
@@ -29,11 +30,12 @@ def collect_image_questions(db, source_path, lines, topic_id=None, source_item_i
     返回 [(题目编号, 题目文字), ...]。
     """
     created = []
-    for chunk in split_question_lines(lines or []):
-        code, _ = collect_question_from_image(
-            db, source_path, chunk["text"],
-            topic_id=topic_id, source_item_id=source_item_id,
-            analysis=chunk.get("analysis", ""),
-        )
-        created.append((code, chunk["text"]))
+    with db.transaction():
+        for chunk in split_question_lines(lines or []):
+            code, _ = collect_question_from_image(
+                db, source_path, chunk["text"],
+                topic_id=topic_id, source_item_id=source_item_id,
+                analysis=chunk.get("analysis", ""),
+            )
+            created.append((code, chunk["text"]))
     return created

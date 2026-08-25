@@ -83,6 +83,56 @@ class ScrollableFrame(tk.Frame):
                 _bind(child)
         _bind(self.inner)
 
+
+class EmptyState(tk.Frame):
+    """统一空状态：图示 + 标题 + 说明 + 可选入口按钮。
+
+    用 place_in(parent) 居中浮在目标容器上，不改变原有布局；不需要时 destroy()。
+    """
+
+    def __init__(self, master, title, description="", action_text=None, command=None,
+                 bg=None, max_width=560):
+        bg = bg or PALETTE["surface"]
+        super().__init__(master, bg=bg)
+        P = PALETTE
+        inner = tk.Frame(self, bg=bg)
+        inner.pack(padx=30, pady=26)
+        self._icon = tk.Canvas(inner, width=76, height=62, bg=bg, highlightthickness=0)
+        self._icon.pack()
+        self._draw_icon()
+        tk.Label(
+            inner, text=title, bg=bg, fg=P["text"],
+            font=("Microsoft YaHei UI", 18, "bold"),
+        ).pack(pady=(14, 0))
+        if description:
+            tk.Label(
+                inner, text=description, bg=bg, fg=P["muted"],
+                font=("Microsoft YaHei UI", 13), wraplength=max_width,
+                justify="left",
+            ).pack(pady=(8, 0))
+        if action_text and command:
+            ttk.Button(
+                inner, text=action_text, style="Accent.TButton", command=command,
+            ).pack(pady=(16, 0))
+
+    def _draw_icon(self):
+        P = PALETTE
+        c = self._icon
+        color = P["primary"]
+        soft = P["primary_light"]
+        # 收纳/文档示意：开口容器 + 内容线，不使用 emoji，避免字体渲染差异
+        c.create_rectangle(12, 10, 64, 54, outline=color, width=2,
+                           fill=soft, tags="empty_icon")
+        c.create_line(12, 10, 26, 28, 64, 10, fill=color, width=2)
+        c.create_line(19, 40, 57, 40, fill=color, width=2)
+        c.create_line(19, 48, 48, 48, fill=color, width=2)
+
+    def place_in(self, parent, rely=0.45):
+        """把空状态居中显示在 parent 上。"""
+        self.place(relx=0.5, rely=rely, anchor="center")
+        return self
+
+
 def show_image_zoom(master, path):
     """双击图片放大查看：新窗口居中显示，Esc / 按钮关闭。"""
     from PIL import Image, ImageTk

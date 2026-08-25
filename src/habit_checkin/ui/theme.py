@@ -141,6 +141,13 @@ FONT_BIG = ("Microsoft YaHei UI", 13, "bold")
 FONT_NUM = ("Microsoft YaHei UI", 20, "bold")
 FONT_HEADER = ("Microsoft YaHei UI", 15, "bold")
 
+# 全局按钮统一字号与内边距，避免各页面按钮大小/间距参差
+BUTTON_FONT = ("Microsoft YaHei UI", 13)
+BUTTON_PAD_X = 13
+BUTTON_PAD_Y = 8
+ACCENT_PAD_X = 15
+ACCENT_PAD_Y = 9
+
 
 def apply_theme(root):
     """应用全局 ttk 样式（clam 主题支持完整自定义）。"""
@@ -168,7 +175,8 @@ def apply_theme(root):
         "TButton",
         background=P["surface"], foreground=P["text"],
         bordercolor=P["border"], lightcolor=P["surface"], darkcolor=P["surface"],
-        relief="flat", padding=(13, 8), focuscolor=P["surface"],
+        relief="flat", font=BUTTON_FONT, padding=(BUTTON_PAD_X, BUTTON_PAD_Y),
+        focuscolor=P["surface"],
     )
     style.map(
         "TButton",
@@ -183,7 +191,8 @@ def apply_theme(root):
         "Accent.TButton",
         background=P["primary"], foreground="#FFFFFF",
         bordercolor=P["primary"], lightcolor=P["primary"], darkcolor=P["primary"],
-        relief="flat", padding=(15, 9), focuscolor=P["primary"],
+        relief="flat", font=BUTTON_FONT, padding=(ACCENT_PAD_X, ACCENT_PAD_Y),
+        focuscolor=P["primary"],
     )
     style.map(
         "Accent.TButton",
@@ -197,7 +206,8 @@ def apply_theme(root):
         "Success.TButton",
         background=P["accent"], foreground="#FFFFFF",
         bordercolor=P["accent"], lightcolor=P["accent"], darkcolor=P["accent"],
-        relief="flat", padding=(15, 9), focuscolor=P["accent"],
+        relief="flat", font=BUTTON_FONT, padding=(ACCENT_PAD_X, ACCENT_PAD_Y),
+        focuscolor=P["accent"],
     )
     style.map(
         "Success.TButton",
@@ -211,7 +221,8 @@ def apply_theme(root):
         "Danger.TButton",
         background=P["danger"], foreground="#FFFFFF",
         bordercolor=P["danger"], lightcolor=P["danger"], darkcolor=P["danger"],
-        relief="flat", padding=(13, 8), focuscolor=P["danger"],
+        relief="flat", font=BUTTON_FONT, padding=(BUTTON_PAD_X, BUTTON_PAD_Y),
+        focuscolor=P["danger"],
     )
     style.map("Danger.TButton", background=[("active", P["danger_hover"]),
                                             ("pressed", P["danger_active"])])

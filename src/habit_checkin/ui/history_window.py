@@ -6,6 +6,7 @@ from datetime import date, datetime
 from tkinter import filedialog, messagebox, ttk
 
 from habit_checkin.db import validate_date
+from habit_checkin.services.clipboard_utils import bind_entry_undo, bind_text_paste
 from habit_checkin.ui.calendar import attach_calendar_on_click
 from habit_checkin.services.export_docx import default_filename, export_docx
 from habit_checkin.services.export_image import default_filename_png, export_image
@@ -35,12 +36,16 @@ class HistoryWindow(tk.Frame):
         top.pack(fill="x")
         ttk.Label(top, text="开始日期：").pack(side="left")
         self.start_entry = ttk.Entry(top, width=11)
+        bind_text_paste(self.start_entry)
         self.start_entry.insert(0, date.today().isoformat())
+        bind_entry_undo(self.start_entry)
         self.start_entry.pack(side="left", padx=(0, 8))
         attach_calendar_on_click(self.start_entry, lambda ds: self._set_entry(self.start_entry, ds))
         ttk.Label(top, text="结束日期：").pack(side="left")
         self.end_entry = ttk.Entry(top, width=11)
+        bind_text_paste(self.end_entry)
         self.end_entry.insert(0, date.today().isoformat())
+        bind_entry_undo(self.end_entry)
         self.end_entry.pack(side="left", padx=(0, 8))
         attach_calendar_on_click(self.end_entry, lambda ds: self._set_entry(self.end_entry, ds))
         ttk.Label(top, text="科目：").pack(side="left")
@@ -51,6 +56,7 @@ class HistoryWindow(tk.Frame):
             values=["全部"] + [r["name"] for r in roots],
         )
         self.filter_box.pack(side="left", padx=(0, 8))
+        ttk.Button(top, text="管理科目", command=self._open_topic_manager).pack(side="left", padx=(0, 8))
         ttk.Button(top, text="查询", command=self._query).pack(side="left")
         ttk.Button(top, text="生成打卡报告", style="Accent.TButton",
                    command=self._open_export_dialog).pack(side="right")
@@ -88,6 +94,17 @@ class HistoryWindow(tk.Frame):
     def _set_entry(entry, ds):
         entry.delete(0, "end")
         entry.insert(0, ds)
+
+    def _open_topic_manager(self):
+        from habit_checkin.ui.topic_manager_dialog import TopicManagerDialog
+        current = self.filter_var.get()
+        dlg = TopicManagerDialog(self, self.db)
+        self.wait_window(dlg)
+        values = ["全部"] + [r["name"] for r in self.db.root_topics()]
+        self.filter_box.configure(values=values)
+        if current not in values:
+            self.filter_var.set("全部")
+        self._query()
 
     def _query(self):
         try:
@@ -172,7 +189,10 @@ class HistoryWindow(tk.Frame):
             return
         ok = messagebox.askyesno(
             "删除记录",
-            "确定删除「{}」这条记录吗？\n其文字总结和图片也会一并删除。".format(item["topic_path"]),
+            "确定删除「{}」这条记录吗？\n"
+            "其文字总结和图片也会一并删除。\n"
+            "题库题目将保留为未分类，来源标记失效；计时数据一并删除。\n"
+            "操作不可撤销，建议先在「设置 → 通用设置」中备份数据。".format(item["topic_path"]),
             parent=self,
         )
         if not ok:

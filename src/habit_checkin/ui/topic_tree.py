@@ -10,7 +10,13 @@ from habit_checkin.ui.theme_menu import ThemeMenu
 
 
 class TopicTreeMixin:
-    """依赖 self.db、self.tree，并提供 _refresh_tree() 的科目树编辑能力。"""
+    """依赖 self.db、self.tree，并提供 _refresh_tree() 的科目树编辑能力。
+
+    默认根节点 iid 为 ""；知识库等带“全部文档”假根节点的页面可把
+    _root_iid 设为该假根节点，避免拖拽/排序时误把假根当科目解析。
+    """
+
+    _root_iid = ""
 
     # ---------- 长按拖拽 ----------
     def _is_descendant(self, iid, ancestor):
@@ -30,7 +36,7 @@ class TopicTreeMixin:
                 if self.tree.item(iid, "open"):
                     walk(iid)
 
-        walk("")
+        walk(self._root_iid)
         return rows
 
     def _highlight(self, iid):
@@ -52,6 +58,9 @@ class TopicTreeMixin:
 
     def _on_drag_press(self, event):
         self._drag_item = self.tree.identify_row(event.y)
+        if self._drag_item == self._root_iid:
+            # “全部文档”等假根节点只作容器，不允许被拖动排序。
+            self._drag_item = None
         self._drag_press_time = time.monotonic()
         self._drag_active = False
         self._drag_target = None
@@ -122,7 +131,7 @@ class TopicTreeMixin:
                     return
             else:
                 try:
-                    self.tree.move(item, "", 0)
+                    self.tree.move(item, self._root_iid, 0)
                 except tk.TclError:
                     return
         self._save_tree_order()
@@ -133,11 +142,13 @@ class TopicTreeMixin:
 
         def walk(parent_iid, parent_id):
             for idx, iid in enumerate(self.tree.get_children(parent_iid)):
+                if iid == self._root_iid:
+                    continue
                 tid = int(iid[1:])
                 entries.append((tid, parent_id, idx))
                 walk(iid, tid)
 
-        walk("", None)
+        walk(self._root_iid, None)
         try:
             self.db.update_topic_tree(entries)
         except ValueError as exc:
@@ -152,7 +163,7 @@ class TopicTreeMixin:
         iid = self.tree.identify_row(event.y)
         menu = ThemeMenu(self)
         self._menu = menu
-        if iid:
+        if iid and iid != self._root_iid:
             topic_id = int(iid[1:])
             row = self.db.conn.execute(
                 "SELECT name, kind, is_preset, disabled FROM topics WHERE id=?", (topic_id,)
@@ -245,7 +256,8 @@ class TopicTreeMixin:
         row = self.db.conn.execute("SELECT name FROM topics WHERE id=?", (topic_id,)).fetchone()
         if not messagebox.askyesno(
             "删除确认",
-            "确定删除「{}」及其所有子知识点吗？\n相关打卡记录和图片将一并删除，不可恢复。".format(row["name"]),
+            "确定删除「{}」及其所有子知识点吗？\n"
+            "思维导图节点、知识库对应分支、打卡记录和图片将一并删除，不可恢复。".format(row["name"]),
             parent=self,
         ):
             return

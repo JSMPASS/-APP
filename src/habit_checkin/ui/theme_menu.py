@@ -89,7 +89,7 @@ class ThemeMenu(tk.Toplevel):
             x = sw - w - 8
         if y + h > sh - 8:
             y = sh - h - 8
-        self.geometry("+{}+{}".format(max(x, 0), max(y, 0)))
+        self.geometry("+{}+{}".format(int(max(x, 0)), int(max(y, 0))))
 
     def _clear(self):
         for it in self._items:

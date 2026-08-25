@@ -6,6 +6,7 @@ import tkinter as tk
 from datetime import date
 from tkinter import messagebox, ttk
 
+from habit_checkin.services.clipboard_utils import bind_entry_undo, bind_text_paste
 from habit_checkin.ui.animate import fade_in, slide_in
 from habit_checkin.ui.calendar import CalendarPopup
 from habit_checkin.ui.common import center_window, setup_styles
@@ -35,6 +36,8 @@ class CountdownDialog(tk.Toplevel):
         tk.Label(body, text="目标名称", bg=P["bg"], fg=P["muted"],
                  font=("Microsoft YaHei UI", 13)).pack(anchor="w")
         self.title_entry = ttk.Entry(body, textvariable=self._var_title, width=26)
+        bind_text_paste(self.title_entry)
+        bind_entry_undo(self.title_entry)
         self.title_entry.pack(fill="x", pady=(4, 12))
 
         # 目标日期

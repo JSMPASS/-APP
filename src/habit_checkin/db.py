@@ -10,8 +10,11 @@ import re
 import shutil
 import sqlite3
 import uuid
+import contextlib
 from datetime import datetime
 from pathlib import Path
+
+from habit_checkin.services.clipboard_utils import extract_content_image_paths
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS topics (
@@ -130,11 +133,69 @@ CREATE TABLE IF NOT EXISTS question_maps (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_docs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT '',
+    topic_id INTEGER REFERENCES topics(id) ON DELETE SET NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    source_item_id INTEGER,
+    source_image TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS knowledge_images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id INTEGER NOT NULL REFERENCES knowledge_docs(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS knowledge_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id INTEGER NOT NULL REFERENCES knowledge_docs(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS knowledge_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    block_id INTEGER NOT NULL REFERENCES knowledge_blocks(id) ON DELETE CASCADE,
+    question_type_id INTEGER NOT NULL REFERENCES question_types(id) ON DELETE CASCADE,
+    auto_link INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS question_materials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_item_id INTEGER REFERENCES plan_items(id) ON DELETE CASCADE,
+    topic_id INTEGER REFERENCES topics(id) ON DELETE SET NULL,
+    detail_type_id INTEGER REFERENCES question_types(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL DEFAULT 'passage',
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS question_material_images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id INTEGER NOT NULL REFERENCES question_materials(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_question_types_parent ON question_types(parent_id);
 
 CREATE INDEX IF NOT EXISTS idx_questions_topic ON questions(topic_id);
 CREATE INDEX IF NOT EXISTS idx_questions_created ON questions(created_at);
 CREATE INDEX IF NOT EXISTS idx_qimages_question ON question_images(question_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_docs_topic ON knowledge_docs(topic_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_images_doc ON knowledge_images(doc_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_blocks_doc ON knowledge_blocks(doc_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_links_block ON knowledge_links(block_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_links_qt ON knowledge_links(question_type_id);
+CREATE INDEX IF NOT EXISTS idx_materials_source ON question_materials(source_item_id);
+CREATE INDEX IF NOT EXISTS idx_material_images_material ON question_material_images(material_id);
 """
 
 # 预置科目目录（叶子节点即打卡项）；版本升级时重建
@@ -178,12 +239,17 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".tif"}
 MAX_IMAGE_EDGE = 1600  # 图片入库时统一压缩到的长边上限（像素）
 
+# 用于区分“参数未传”与“显式设为 None/空值”
+_UNSET = object()
+
 
 class Database:
     def __init__(self, db_path, images_dir, base_dir):
         self.db_path = str(db_path)
         self.images_dir = Path(images_dir)
         self.base_dir = Path(base_dir)
+        self._revision = 0
+        self._transaction_depth = 0
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
@@ -195,10 +261,42 @@ class Database:
         self._migrate_remove_cuoti_topic()
         self._migrate_topic_kinds()
         self._migrate_ensure_method_topics()
+        self._migrate_knowledge_timestamps()
         self._seed_metrics()
         self._seed_question_types()
 
     # ---------- 基础 ----------
+    def revision(self):
+        """数据变更版本号，供页面判断是否需要重新加载。"""
+        return self._revision
+
+    def _commit(self):
+        """统一提交入口：提交后递增版本号，通知页面刷新。"""
+        if self._transaction_depth > 0:
+            # 外层事务尚未结束：不提交，由最外层 with 块统一提交。
+            return
+        self.conn.commit()
+        self._revision += 1
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """显式事务上下文：内部所有写操作在一次提交内完成。
+
+        支持嵌套调用；内层不重复提交，最外层提交或回滚。任何异常都会回滚，
+        避免多表关联（题目-材料-细分分类-知识链接）出现半更新状态。
+        """
+        self._transaction_depth += 1
+        try:
+            yield self
+            self._transaction_depth -= 1
+            if self._transaction_depth == 0:
+                self.conn.commit()
+                self._revision += 1
+        except Exception:
+            self._transaction_depth = max(0, self._transaction_depth - 1)
+            self.conn.rollback()
+            raise
+
     # 轻量迁移：后续给表加字段时在此追加 (表名, 列名, ALTER DDL)，按需幂等执行
     _COLUMN_MIGRATIONS = [
         ("plan_items", "elapsed_seconds",
@@ -239,6 +337,28 @@ class Database:
          "ALTER TABLE question_maps ADD COLUMN layout_type TEXT NOT NULL DEFAULT 'logic'"),
         ("question_types", "free_float",
          "ALTER TABLE question_types ADD COLUMN free_float INTEGER NOT NULL DEFAULT 0"),
+        ("checkin_images", "purpose",
+         "ALTER TABLE checkin_images ADD COLUMN purpose TEXT NOT NULL DEFAULT 'question'"),
+        ("plan_items", "basic_knowledge",
+         "ALTER TABLE plan_items ADD COLUMN basic_knowledge TEXT NOT NULL DEFAULT ''"),
+        ("plan_items", "content_type",
+         "ALTER TABLE plan_items ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"),
+        ("plan_items", "material",
+         "ALTER TABLE plan_items ADD COLUMN material TEXT NOT NULL DEFAULT ''"),
+        ("plan_items", "answer",
+         "ALTER TABLE plan_items ADD COLUMN answer TEXT NOT NULL DEFAULT ''"),
+        ("checkin_images", "group_key",
+         "ALTER TABLE checkin_images ADD COLUMN group_key TEXT NOT NULL DEFAULT ''"),
+        ("questions", "material_id",
+         "ALTER TABLE questions ADD COLUMN material_id INTEGER"),
+        ("questions", "detail_type_id",
+         "ALTER TABLE questions ADD COLUMN detail_type_id INTEGER"),
+        ("questions", "stem",
+         "ALTER TABLE questions ADD COLUMN stem TEXT NOT NULL DEFAULT ''"),
+        ("questions", "options",
+         "ALTER TABLE questions ADD COLUMN options TEXT NOT NULL DEFAULT ''"),
+        ("questions", "answer",
+         "ALTER TABLE questions ADD COLUMN answer TEXT NOT NULL DEFAULT ''"),
     ]
 
     def _init_schema(self):
@@ -249,7 +369,13 @@ class Database:
                 self.conn.execute(ddl)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_question_types_map ON question_types(map_id, parent_id)")
         self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_question_maps_topic ON question_maps(topic_id)")
-        self.conn.commit()
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_links_unique "
+            "ON knowledge_links(block_id, question_type_id)"
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_questions_material ON questions(material_id)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_questions_detail ON questions(detail_type_id)")
+        self._commit()
 
     def _seed_topics(self):
         cur = self.conn.execute("SELECT value FROM settings WHERE key='seed_version'")
@@ -296,7 +422,7 @@ class Database:
         self.conn.execute("UPDATE plan_items SET topic_id=? WHERE topic_id=?", (new_id, old["id"]))
         self.conn.execute("UPDATE questions SET topic_id=? WHERE topic_id=?", (new_id, old["id"]))
         self.conn.execute("DELETE FROM topics WHERE id=?", (old["id"],))
-        self.conn.commit()
+        self._commit()
 
     def _migrate_topic_kinds(self):
         """把已知的具体做法科目标记为 method，其余保持 category（幂等）。"""
@@ -305,7 +431,7 @@ class Database:
             "UPDATE topics SET kind='method' WHERE name IN ({})".format(placeholders),
             tuple(METHOD_TOPIC_NAMES),
         )
-        self.conn.commit()
+        self._commit()
 
     def _migrate_ensure_method_topics(self):
         """把计划生成依赖的具体做法节点补回科目管理（幂等，不重建已删除的科目根）。"""
@@ -333,7 +459,19 @@ class Database:
                 "VALUES (?,?,?,?,?,?)",
                 (root["id"], method_name, "method", 0, root["disabled"], max_order + 1),
             )
-        self.conn.commit()
+        self._commit()
+
+    def _migrate_knowledge_timestamps(self):
+        """旧版本知识库把更新时间写成 0/空，统一回退为创建时间。"""
+        self.conn.execute(
+            "UPDATE knowledge_docs SET updated_at=created_at "
+            "WHERE updated_at IS NULL OR updated_at='' OR updated_at='0'"
+        )
+        self.conn.execute(
+            "UPDATE knowledge_blocks SET updated_at=created_at "
+            "WHERE updated_at IS NULL OR updated_at='' OR updated_at='0'"
+        )
+        self._commit()
 
 
     BUILTIN_METRICS = [
@@ -361,7 +499,7 @@ class Database:
                 "VALUES (?, 'builtin', ?, 1, ?, ?)",
                 (name, key, unit, idx),
             )
-        self.conn.commit()
+        self._commit()
 
 
     _SUBJECT_COLORS = ["#4A7BE0", "#2FBF71", "#E39A3B", "#DC2626", "#8B5CF6", "#0EA5E9", "#F59E0B"]
@@ -375,7 +513,7 @@ class Database:
             self._ensure_map_for_topic(
                 root["id"], root["name"], self._SUBJECT_COLORS[idx % len(self._SUBJECT_COLORS)]
             )
-        self.conn.commit()
+        self._commit()
         self._auto_import_preset_types()
 
     def _ensure_map_for_topic(self, topic_id, subject_name, color=None):
@@ -432,7 +570,7 @@ class Database:
 
     def ensure_map_for_topic(self, topic_id, subject_name, color=None):
         self._ensure_map_for_topic(topic_id, subject_name, color)
-        self.conn.commit()
+        self._commit()
 
     def import_preset_question_types(self, map_id):
         """把科目管理的知识点树按层级导入该科目思维导图（幂等）。
@@ -486,7 +624,7 @@ class Database:
 
         for idx, kid in enumerate(by_parent.get(m["topic_id"], [])):
             walk(kid, root_node["id"], idx)
-        self.conn.commit()
+        self._commit()
         return imported
 
     def _auto_import_preset_types(self):
@@ -508,7 +646,7 @@ class Database:
             if not has_children:
                 self.import_preset_question_types(r["id"])
         self.set_setting("mindmap_preset_imported", "1")
-        self.conn.commit()
+        self._commit()
 
     def close(self):
         self.conn.close()
@@ -529,16 +667,20 @@ class Database:
             return str(p)
         return str((self.base_dir / p).resolve())
 
-    def store_image_from_path(self, src_path):
+    def store_image(self, source):
         """复制图片到 data/images/，返回相对路径。
+
+        支持文件路径或 PIL Image 对象（剪贴板粘贴时直接入库，避免临时文件）。
 
         - webp 等 Word 不支持的格式转成 PNG；
         - 长边超过 MAX_IMAGE_EDGE 时等比压缩（减小 data/ 体积）；
         - GIF 保持原样以保留动画；未缩放的非 webp 图片原样拷贝，避免重复编码损失质量。
         """
-        src = Path(src_path)
+        if hasattr(source, "save"):
+            return self._store_image_from_pil(source)
+        src = Path(source)
         if not src.is_file():
-            raise FileNotFoundError(src_path)
+            raise FileNotFoundError(source)
         img = None
         try:
             from PIL import Image
@@ -576,6 +718,43 @@ class Database:
         finally:
             if img is not None:
                 img.close()
+
+    def store_image_from_path(self, src_path):
+        """复制图片文件到 data/images/，返回相对路径（兼容旧调用）。"""
+        return self.store_image(src_path)
+
+    def _store_image_from_pil(self, image):
+        """把 PIL Image 保存到 data/images/，返回相对路径。"""
+        from PIL import Image
+        fmt = (getattr(image, "format", None) or "").upper()
+        try:
+            w, h = image.size
+        except Exception:
+            w, h = 0, 0
+        if fmt == "GIF":
+            ext = ".gif"
+        else:
+            ext = ".png"
+            if image.mode not in ("RGB", "L", "RGBA", "P"):
+                image = image.convert("RGB")
+        name = "{}_{}{}".format(datetime.now().strftime("%Y%m%d%H%M%S"), uuid.uuid4().hex[:8], ext)
+        dest = self.images_dir / name
+        try:
+            if fmt == "GIF":
+                image.save(dest, "GIF")
+            else:
+                if max(w, h) > MAX_IMAGE_EDGE:
+                    scale = MAX_IMAGE_EDGE / float(max(w, h))
+                    image = image.resize(
+                        (max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+                image.save(dest, "PNG")
+            return self.rel_path(dest)
+        finally:
+            try:
+                if hasattr(image, "close"):
+                    image.close()
+            except Exception:
+                pass
 
     def delete_image_files(self, rel_paths):
         for rel in rel_paths:
@@ -638,7 +817,7 @@ class Database:
 
         return {tid: build(tid) for tid in ids}
 
-    def add_topic(self, name, parent_id=None, kind=None):
+    def add_topic(self, name, parent_id=None, kind=None, sync=True):
         name = name.strip()
         if not name:
             raise ValueError("名称不能为空")
@@ -662,33 +841,241 @@ class Database:
             "INSERT INTO topics(parent_id, name, kind, is_preset, sort_order) VALUES (?,?,?,?,?)",
             (parent_id, name, kind, 0, max_order + 1),
         )
-        self.conn.commit()
+        self._commit()
         if parent_id is None:
             self._ensure_map_for_topic(cur.lastrowid, name)
-            self.conn.commit()
+            self._commit()
+        if sync:
+            self._sync_new_topic(cur.lastrowid)
         return cur.lastrowid
+
+    def _insert_topic_row(self, name, parent_id, kind, is_preset=0, sort_order=None):
+        """不提交事务地插入科目行，供需要整体事务的联动方法复用。"""
+        if sort_order is None:
+            m = self.conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) AS m FROM topics WHERE parent_id IS ?",
+                (parent_id,),
+            ).fetchone()["m"]
+            sort_order = m + 1
+        cur = self.conn.execute(
+            "INSERT INTO topics(parent_id, name, kind, is_preset, sort_order) VALUES (?,?,?,?,?)",
+            (parent_id, name, kind, is_preset, sort_order),
+        )
+        return cur.lastrowid
+
+    def _root_topic_id(self, topic_id):
+        """向上找到科目根节点 id。"""
+        cur = topic_id
+        seen = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            row = self.conn.execute("SELECT parent_id FROM topics WHERE id=?", (cur,)).fetchone()
+            if not row:
+                return None
+            if row["parent_id"] is None:
+                return cur
+            cur = row["parent_id"]
+        return None
+
+    def _sync_new_topic(self, topic_id):
+        """新增/切换为具体分类后，联动同步思维导图节点与知识库文档（幂等）。"""
+        row = self.conn.execute(
+            "SELECT parent_id, name, kind FROM topics WHERE id=?", (topic_id,)
+        ).fetchone()
+        if not row or row["kind"] != "category":
+            return
+        if row["parent_id"] is None:
+            # 根科目：思维导图由 add_topic/_ensure_map_for_topic 创建，这里只联动知识库
+            self.ensure_topic_knowledge_doc(topic_id)
+            self._commit()
+            return
+        root_id = self._root_topic_id(topic_id)
+        if root_id is None:
+            return
+        m = self.conn.execute(
+            "SELECT id FROM question_maps WHERE topic_id=?", (root_id,)
+        ).fetchone()
+        if not m:
+            return
+        map_id = m["id"]
+        if row["parent_id"] == root_id:
+            parent = self.conn.execute(
+                "SELECT id, node_type FROM question_types "
+                "WHERE map_id=? AND parent_id IS NULL LIMIT 1",
+                (map_id,),
+            ).fetchone()
+        else:
+            parent = self.conn.execute(
+                "SELECT id, node_type FROM question_types "
+                "WHERE map_id=? AND topic_id=? ORDER BY id LIMIT 1",
+                (map_id, row["parent_id"]),
+            ).fetchone()
+        if not parent:
+            return
+        if self.conn.execute(
+            "SELECT 1 FROM question_types WHERE map_id=? AND topic_id=? LIMIT 1",
+            (map_id, topic_id),
+        ).fetchone():
+            self.ensure_topic_knowledge_doc(topic_id)
+            self._commit()
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if parent["node_type"] == "type":
+            self.conn.execute(
+                "UPDATE question_types SET node_type='category', updated_at=? WHERE id=?",
+                (now, parent["id"]),
+            )
+        has_children = self.conn.execute(
+            "SELECT 1 FROM topics WHERE parent_id=? AND disabled=0 LIMIT 1", (topic_id,)
+        ).fetchone()
+        max_order = self.conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) AS m FROM question_types WHERE parent_id IS ?",
+            (parent["id"],),
+        ).fetchone()["m"]
+        self.conn.execute(
+            "INSERT INTO question_types(parent_id, map_id, name, node_type, topic_id, "
+            "sort_order, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (parent["id"], map_id, row["name"],
+             "category" if has_children else "type",
+             topic_id, max_order + 1, now, now),
+        )
+        self.ensure_topic_knowledge_doc(topic_id)
+        self._commit()
+
+    def ensure_topic_knowledge_doc(self, topic_id):
+        """为科目知识点补建同名知识库文档并绑定 topic_id（幂等）。"""
+        row = self.conn.execute(
+            "SELECT name FROM topics WHERE id=?", (topic_id,)
+        ).fetchone()
+        if not row:
+            return None
+        existing = self.conn.execute(
+            "SELECT id FROM knowledge_docs WHERE topic_id=?", (topic_id,)
+        ).fetchone()
+        if existing:
+            return existing["id"]
+        return self.add_knowledge_doc(title=row["name"], topic_id=topic_id, source="manual")
 
     def set_topic_kind(self, topic_id, kind):
         """切换科目类型：category=具体分类（进入细分/思维导图），method=具体做法。"""
         if kind not in ("category", "method"):
             raise ValueError("科目类型必须是「具体分类」或「具体做法」")
+        old = self.conn.execute("SELECT kind FROM topics WHERE id=?", (topic_id,)).fetchone()
         self.conn.execute("UPDATE topics SET kind=? WHERE id=?", (kind, topic_id))
-        self.conn.commit()
+        self._commit()
+        if kind == "category" and (not old or old["kind"] != "category"):
+            # 具体做法切换为具体分类后补齐思维导图节点与知识库文档
+            self._sync_new_topic(topic_id)
 
     def rename_topic(self, topic_id, name):
         name = name.strip()
         if not name:
             raise ValueError("名称不能为空")
+        old = self.conn.execute("SELECT name FROM topics WHERE id=?", (topic_id,)).fetchone()
         self.conn.execute("UPDATE topics SET name=? WHERE id=?", (name, topic_id))
-        self.conn.commit()
-        row = self.conn.execute("SELECT parent_id FROM topics WHERE id=?", (topic_id,)).fetchone()
-        if row and row["parent_id"] is None:
+        # 同步思维导图与知识库中关联该知识点的节点名称，保证各处显示一致
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "UPDATE question_types SET name=?, updated_at=? WHERE topic_id=?",
+            (name, now, topic_id),
+        )
+        if old:
+            self.conn.execute(
+                "UPDATE knowledge_docs SET title=?, updated_at=? WHERE topic_id=? AND title=?",
+                (name, now, topic_id, old["name"]),
+            )
+        self._commit()
+        parent_row = self.conn.execute("SELECT parent_id FROM topics WHERE id=?", (topic_id,)).fetchone()
+        if parent_row and parent_row["parent_id"] is None:
             self._ensure_map_for_topic(topic_id, name)
-            self.conn.commit()
+            self._commit()
+
+    def get_topic(self, topic_id):
+        row = self.conn.execute("SELECT * FROM topics WHERE id=?", (topic_id,)).fetchone()
+        return dict(row) if row else None
+
+    def parent_topic_for_question_type(self, qtype_id, map_id=None):
+        """向上查找导图节点在科目管理中的父知识点：优先沿用最近关联的父节点。"""
+        seen = set()
+        cur = qtype_id
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            node = self.get_question_type(cur)
+            if node is None:
+                break
+            tid = node.get("topic_id")
+            if tid is not None:
+                topic = self.get_topic(tid)
+                if topic and not topic.get("disabled") and topic.get("kind") == "category":
+                    return tid
+            cur = node.get("parent_id")
+        if map_id:
+            m = self.get_question_map(map_id)
+            if m and m.get("topic_id"):
+                return m["topic_id"]
+        return None
+
+    def add_synced_topic(self, name, parent_qtype_id, map_id):
+        """思维导图新增节点时同步创建科目「具体分类」与知识库文档（单事务）。
+
+        只负责科目与知识库；导图节点由调用方创建后回填 topic_id。
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("名称不能为空")
+        parent_topic_id = self.parent_topic_for_question_type(parent_qtype_id, map_id)
+        if parent_topic_id is None:
+            raise ValueError("当前思维导图未关联科目管理，无法同步新增")
+        topic_id = self._insert_topic_row(name, parent_topic_id, "category")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "INSERT INTO knowledge_docs(title, topic_id, source, source_item_id, "
+            "source_image, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (name, topic_id, "manual", None, "", now, now),
+        )
+        self._commit()
+        return topic_id
+
+    def rename_question_type_with_sync(self, qtype_id, name):
+        """事务化同步重命名：导图节点、关联科目及知识库文档同一次提交。"""
+        name = name.strip()
+        if not name:
+            raise ValueError("名称不能为空")
+        node = self.get_question_type(qtype_id)
+        if not node:
+            raise ValueError("节点不存在")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        topic_id = node.get("topic_id")
+        self.conn.execute(
+            "UPDATE question_types SET name=?, updated_at=? WHERE id=?",
+            (name, now, qtype_id),
+        )
+        if topic_id:
+            old = self.conn.execute(
+                "SELECT name FROM topics WHERE id=?", (topic_id,)
+            ).fetchone()
+            if old:
+                self.conn.execute("UPDATE topics SET name=? WHERE id=?", (name, topic_id))
+                self.conn.execute(
+                    "UPDATE question_types SET name=?, updated_at=? WHERE topic_id=?",
+                    (name, now, topic_id),
+                )
+                self.conn.execute(
+                    "UPDATE knowledge_docs SET title=?, updated_at=? "
+                    "WHERE topic_id=? AND title=?",
+                    (name, now, topic_id, old["name"]),
+                )
+                parent_row = self.conn.execute(
+                    "SELECT parent_id FROM topics WHERE id=?", (topic_id,)
+                ).fetchone()
+                if parent_row and parent_row["parent_id"] is None:
+                    self._ensure_map_for_topic(topic_id, name)
+        self._commit()
+        return topic_id
 
     def set_topic_disabled(self, topic_id, disabled):
         self.conn.execute("UPDATE topics SET disabled=? WHERE id=?", (1 if disabled else 0, topic_id))
-        self.conn.commit()
+        self._commit()
 
     def subtree_ids(self, topic_id):
         ids = [topic_id]
@@ -745,6 +1132,11 @@ class Database:
         return out
 
     def delete_topic_cascade(self, topic_id):
+        """删除科目整支，并同步清理思维导图节点与知识库分支。
+
+        计划/打卡图片、知识库文档及图片会一并删除；题库题目保留为“未分类”，
+        避免删除科目时误删用户辛苦整理的错题。
+        """
         ids = self.subtree_ids(topic_id)
         placeholders = ",".join("?" * len(ids))
         rows = self.conn.execute(
@@ -759,9 +1151,51 @@ class Database:
             ip = ",".join("?" * len(item_ids))
             self.conn.execute(f"DELETE FROM checkin_images WHERE plan_item_id IN ({ip})", item_ids)
             self.conn.execute(f"DELETE FROM plan_items WHERE id IN ({ip})", item_ids)
+
+        # 收集导图节点整棵子树，删除前先把题目/材料的细分题型关联置空，
+        # 避免删除节点后 questions.detail_type_id 残留为孤立引用
+        qtype_rows = self.conn.execute(
+            "SELECT id FROM question_types WHERE topic_id IN ({})".format(placeholders), ids
+        ).fetchall()
+        qtype_ids = []
+        for r in qtype_rows:
+            for qid in self._question_type_subtree_ids(r["id"]):
+                if qid not in qtype_ids:
+                    qtype_ids.append(qid)
+        if qtype_ids:
+            qp = ",".join("?" * len(qtype_ids))
+            self.conn.execute(
+                "UPDATE questions SET detail_type_id=NULL WHERE detail_type_id IN ({})".format(qp),
+                qtype_ids,
+            )
+            self.conn.execute(
+                "UPDATE question_materials SET detail_type_id=NULL "
+                "WHERE detail_type_id IN ({})".format(qp),
+                qtype_ids,
+            )
+
+        # 级联删除思维导图中绑定该科目/子科目的节点（子树经外键一并清理）
         self.conn.execute(
-            "UPDATE question_types SET topic_id=NULL WHERE topic_id IN ({})".format(placeholders), ids
+            "DELETE FROM question_types WHERE topic_id IN ({})".format(placeholders), ids
         )
+
+        # 级联删除知识库对应分支的文档（块、图片、导图关联随外键清理）
+        doc_rows = self.conn.execute(
+            "SELECT id FROM knowledge_docs WHERE topic_id IN ({})".format(placeholders), ids
+        ).fetchall()
+        doc_ids = [r["id"] for r in doc_rows]
+        if doc_ids:
+            dp = ",".join("?" * len(doc_ids))
+            for row in self.conn.execute(
+                f"SELECT file_path FROM knowledge_images WHERE doc_id IN ({dp})", doc_ids
+            ):
+                rels.add(row["file_path"])
+            for row in self.conn.execute(
+                f"SELECT content FROM knowledge_blocks WHERE doc_id IN ({dp})", doc_ids
+            ):
+                rels.update(extract_content_image_paths(row["content"] or ""))
+            self.conn.execute(f"DELETE FROM knowledge_docs WHERE id IN ({dp})", doc_ids)
+
         # 题目保留到“未分类”，避免删除科目时因外键失败，也避免误删用户题库
         self.conn.execute(
             "UPDATE questions SET topic_id=NULL WHERE topic_id IN ({})".format(placeholders), ids
@@ -772,8 +1206,8 @@ class Database:
             self.conn.execute("DELETE FROM question_types WHERE map_id=?", (mr["id"],))
             self.conn.execute("DELETE FROM question_maps WHERE id=?", (mr["id"],))
         self.conn.execute(f"DELETE FROM topics WHERE id IN ({placeholders})", ids)
-        self.conn.commit()
-        self.delete_image_files(rels)
+        self._commit()
+        self.delete_image_files([rel for rel in rels if rel and not self.is_image_used(rel)])
 
     def root_topics(self):
         return [dict(r) for r in self.conn.execute(
@@ -827,7 +1261,7 @@ class Database:
             "INSERT INTO plans(date, title, created_at) VALUES (?,?,?)",
             (date, title, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
     def delete_plan(self, plan_id):
@@ -838,7 +1272,7 @@ class Database:
         ).fetchall()
         rels = {r["file_path"] for r in rows if r["file_path"]}
         self.conn.execute("DELETE FROM plans WHERE id=?", (plan_id,))
-        self.conn.commit()
+        self._commit()
         self.delete_image_files(rels)
 
     def copy_plan(self, src_date, dst_date, replace_existing=True):
@@ -862,7 +1296,7 @@ class Database:
                 (plan_id, it["topic_id"], it["reminder_time"], it["task_type"],
                  datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             )
-        self.conn.commit()
+        self._commit()
         return len(items)
 
     # ---------- 计划项 ----------
@@ -909,7 +1343,7 @@ class Database:
             "UPDATE plan_items SET elapsed_seconds = MAX(0, ?) WHERE id=?",
             (int(seconds), item_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def add_plan_item(self, plan_id, topic_id, reminder_time=None, task_type="main", note=""):
         if reminder_time and not _TIME_RE.match(reminder_time):
@@ -920,7 +1354,7 @@ class Database:
             (plan_id, topic_id, reminder_time, task_type, note or "",
              datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
     def add_plan_items(self, plan_id, entries):
@@ -936,32 +1370,56 @@ class Database:
             "VALUES (?,?,?,?,?,?)",
             rows,
         )
-        self.conn.commit()
+        self._commit()
         return len(rows)
 
     def set_item_reminder(self, item_id, reminder_time):
         if reminder_time and not _TIME_RE.match(reminder_time):
             raise ValueError("提醒时间格式应为 HH:MM")
         self.conn.execute("UPDATE plan_items SET reminder_time=? WHERE id=?", (reminder_time, item_id))
-        self.conn.commit()
+        self._commit()
 
-    def update_checkin(self, item_id, note, done=True, checked_at=None, preserve_time=True):
+    def update_checkin(self, item_id, note, done=True, checked_at=None, preserve_time=True,
+                       basic_knowledge=None):
         row = self.conn.execute("SELECT done, checked_at FROM plan_items WHERE id=?", (item_id,)).fetchone()
         if checked_at is None:
             checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 已完成的项保留首次打卡时间
         if preserve_time and row and row["done"] and row["checked_at"]:
             checked_at = row["checked_at"]
+        if basic_knowledge is not None:
+            self.conn.execute(
+                "UPDATE plan_items SET note=?, basic_knowledge=?, done=?, checked_at=? WHERE id=?",
+                (note or "", basic_knowledge or "", 1 if done else 0,
+                 checked_at if done else None, item_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE plan_items SET note=?, done=?, checked_at=? WHERE id=?",
+                (note or "", 1 if done else 0, checked_at if done else None, item_id),
+            )
+        self._commit()
+
+    def update_checkin_full(self, item_id, note="", done=True, checked_at=None,
+                            basic_knowledge="", material="", answer="", content_type="text"):
+        """保存完整打卡内容：富文本知识/材料/题目/答案 + 内容类型。"""
+        row = self.conn.execute("SELECT done, checked_at FROM plan_items WHERE id=?", (item_id,)).fetchone()
+        if checked_at is None:
+            checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if row and row["done"] and row["checked_at"]:
+            checked_at = row["checked_at"]
         self.conn.execute(
-            "UPDATE plan_items SET note=?, done=?, checked_at=? WHERE id=?",
-            (note or "", 1 if done else 0, checked_at if done else None, item_id),
+            "UPDATE plan_items SET note=?, basic_knowledge=?, material=?, answer=?, content_type=?, "
+            "done=?, checked_at=? WHERE id=?",
+            (note or "", basic_knowledge or "", material or "", answer or "",
+             content_type or "text", 1 if done else 0, checked_at if done else None, item_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def clear_checked_at(self, item_id):
         """仅清空打卡时间，保留完成状态与总结。"""
         self.conn.execute("UPDATE plan_items SET checked_at=NULL WHERE id=?", (item_id,))
-        self.conn.commit()
+        self._commit()
 
     def reset_plan_item(self, item_id):
         """把打卡项复原为未打卡：清除状态、时间、总结、图片与计时。"""
@@ -971,10 +1429,11 @@ class Database:
         rels = {r["file_path"] for r in rows if r["file_path"]}
         self.conn.execute("DELETE FROM checkin_images WHERE plan_item_id=?", (item_id,))
         self.conn.execute(
-            "UPDATE plan_items SET done=0, note='', checked_at=NULL, elapsed_seconds=0 WHERE id=?",
+            "UPDATE plan_items SET done=0, note='', basic_knowledge='', checked_at=NULL, "
+            "elapsed_seconds=0 WHERE id=?",
             (item_id,),
         )
-        self.conn.commit()
+        self._commit()
         self.delete_image_files(rels)
 
     def delete_plan_item(self, item_id):
@@ -984,7 +1443,7 @@ class Database:
         rels = {r["file_path"] for r in rows if r["file_path"]}
         self.conn.execute("DELETE FROM checkin_images WHERE plan_item_id=?", (item_id,))
         self.conn.execute("DELETE FROM plan_items WHERE id=?", (item_id,))
-        self.conn.commit()
+        self._commit()
         self.delete_image_files(rels)
 
     # ---------- 图片 ----------
@@ -993,7 +1452,7 @@ class Database:
             "INSERT INTO checkin_images(plan_item_id, file_path, sort_order) VALUES (?,?,?)",
             (item_id, rel_path, sort_order),
         )
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
     def get_images(self, item_id):
@@ -1008,8 +1467,71 @@ class Database:
         """
         return self._sync_images("checkin_images", "plan_item_id", item_id, kept_rels, new_sources)
 
+    def sync_checkin_images_with_purpose(self, item_id, entries):
+        """按用途同步打卡项图片。
+
+        entries: [(已入库 rel 或新图片绝对路径, purpose, group_key?)]，
+        purpose 为 'question' / 'knowledge' / 'material'，
+        group_key 用于把同一材料/长文的多张图片归为一组。
+        已存在记录更新用途；新文件先入库再写入用途；未出现在列表中的旧图删除。
+        """
+        def _as_rel(path):
+            p = Path(path)
+            if not p.is_absolute() and (self.base_dir / p).is_file():
+                return p.as_posix()
+            return self.store_image_from_path(path)
+
+        mapped = []
+        for entry in entries:
+            rel, purpose = entry[0], entry[1]
+            group_key = entry[2] if len(entry) > 2 else ""
+            if purpose not in ("question", "knowledge", "material"):
+                purpose = "question"
+            mapped.append((_as_rel(rel), purpose, group_key or ""))
+        by_rel = {}
+        for rel, purpose, group_key in mapped:
+            by_rel.setdefault(rel, (purpose, group_key))
+        rows = self.conn.execute(
+            "SELECT id, file_path, purpose, group_key FROM checkin_images WHERE plan_item_id=?",
+            (item_id,),
+        ).fetchall()
+        for img in rows:
+            rel = img["file_path"]
+            if rel in by_rel:
+                purpose, group_key = by_rel[rel]
+                old_purpose = img["purpose"] or "question"
+                old_group = img["group_key"] or ""
+                if old_purpose != purpose or old_group != group_key:
+                    self.conn.execute(
+                        "UPDATE checkin_images SET purpose=?, group_key=? WHERE id=?",
+                        (purpose, group_key, img["id"]),
+                    )
+                by_rel.pop(rel, None)
+            else:
+                self.conn.execute("DELETE FROM checkin_images WHERE id=?", (img["id"],))
+                self.delete_image_files([rel])
+        for rel, (purpose, group_key) in by_rel.items():
+            max_order = self.conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) AS m FROM checkin_images "
+                "WHERE plan_item_id=?",
+                (item_id,),
+            ).fetchone()["m"]
+            self.conn.execute(
+                "INSERT INTO checkin_images(plan_item_id, file_path, sort_order, purpose, group_key) "
+                "VALUES (?,?,?,?,?)",
+                (item_id, rel, max_order + 1, purpose, group_key),
+            )
+        self._commit()
+        return self.get_images(item_id)
+
     def _sync_images(self, table, fk_col, owner_id, kept_rels, new_sources):
         """checkin_images / question_images 共用的同步实现。"""
+        if table == "checkin_images":
+            purpose_col = ", purpose"
+            purpose_val = ", 'question'"
+        else:
+            purpose_col = ""
+            purpose_val = ""
         new_rels = []
         for src in new_sources:
             rel = self.store_image_from_path(src)
@@ -1019,7 +1541,8 @@ class Database:
                 (owner_id,),
             ).fetchone()["m"]
             self.conn.execute(
-                "INSERT INTO {}({}, file_path, sort_order) VALUES (?,?,?)".format(table, fk_col),
+                "INSERT INTO {}({}, file_path, sort_order{}) VALUES (?,?,?{})".format(
+                    table, fk_col, purpose_col, purpose_val),
                 (owner_id, rel, max_order + 1),
             )
         keep = set(kept_rels) | set(new_rels)
@@ -1030,7 +1553,7 @@ class Database:
             if img["file_path"] not in keep:
                 self.conn.execute("DELETE FROM {} WHERE id=?".format(table), (img["id"],))
                 self.delete_image_files([img["file_path"]])
-        self.conn.commit()
+        self._commit()
         return [dict(r) for r in self.conn.execute(
             "SELECT * FROM {} WHERE {} = ? ORDER BY sort_order, id".format(table, fk_col),
             (owner_id,),
@@ -1041,7 +1564,7 @@ class Database:
         if not row:
             return
         self.conn.execute("DELETE FROM checkin_images WHERE id=?", (image_id,))
-        self.conn.commit()
+        self._commit()
         self.delete_image_files([row["file_path"]])
 
     # ---------- 历史查询 ----------
@@ -1094,7 +1617,7 @@ class Database:
             "INSERT INTO settings(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, str(value)),
         )
-        self.conn.commit()
+        self._commit()
 
     def get_bool_setting(self, key, default=False):
         v = self.get_setting(key, None)
@@ -1112,7 +1635,7 @@ class Database:
             "UPDATE topics SET parent_id=?, sort_order=? WHERE id=?",
             (new_parent_id, new_order, topic_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def update_topic_tree(self, entries):
         """批量保存科目树结构。entries: [(topic_id, parent_id, sort_order), ...]"""
@@ -1123,7 +1646,7 @@ class Database:
             "UPDATE topics SET parent_id=?, sort_order=? WHERE id=?",
             [(pid, order, tid) for tid, pid, order in entries],
         )
-        self.conn.commit()
+        self._commit()
 
     # ---------- 题库 ----------
     def collected_checkin_texts(self, item_id):
@@ -1146,22 +1669,25 @@ class Database:
 
     def add_question(self, topic_id=None, question_text="", analysis="", result=None,
                      result_reason="", source="manual", source_item_id=None,
-                     self_analysis="", correct_analysis="", reflection=""):
+                     self_analysis="", correct_analysis="", reflection="",
+                     material_id=None, detail_type_id=None, stem="", options="", answer=""):
         code = self.next_question_code()
         cur = self.conn.execute(
             "INSERT INTO questions(code, topic_id, source, source_item_id, question_text, analysis, "
-            "result, result_reason, self_analysis, correct_analysis, reflection, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "result, result_reason, self_analysis, correct_analysis, reflection, "
+            "material_id, detail_type_id, stem, options, answer, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (code, topic_id, source, source_item_id, question_text or "", analysis or "",
              result, result_reason or "", self_analysis or "", correct_analysis or "",
-             reflection or "", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+             reflection or "", material_id, detail_type_id, stem or "", options or "", answer or "",
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
         self.conn.execute(
             "INSERT INTO settings(key, value) VALUES ('question_seq', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (int(code[1:]),),
         )
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
     def get_question(self, qid):
@@ -1171,9 +1697,20 @@ class Database:
         d = dict(row)
         d["topic_path"] = self.topic_path(d["topic_id"]) if d["topic_id"] else "（未分类）"
         d["images"] = self.get_question_images(qid)
+        if d.get("material_id"):
+            mat = self.get_question_material(d["material_id"])
+            d["material_title"] = mat["title"] if mat else ""
+        else:
+            d["material_title"] = ""
+        d["detail_type_name"] = ""
+        if d.get("detail_type_id"):
+            node = self.get_question_type(d["detail_type_id"])
+            if node:
+                d["detail_type_name"] = node.get("name") or ""
         return d
 
-    def list_questions(self, topic_id=None, result=None, start_date=None, end_date=None, search=None):
+    def list_questions(self, topic_id=None, result=None, start_date=None, end_date=None, search=None,
+                       material_id=None, detail_type_id=None, source_item_id=None, source=None):
         sql = "SELECT * FROM questions WHERE 1=1"
         params = []
         if topic_id is not None:
@@ -1192,19 +1729,57 @@ class Database:
         if search:
             sql += " AND (code LIKE ? OR question_text LIKE ? OR analysis LIKE ?)"
             params.extend(["%" + search + "%"] * 3)
+        if material_id is not None:
+            sql += " AND material_id=?"
+            params.append(material_id)
+        if detail_type_id is not None:
+            ids = self._question_type_subtree_ids(detail_type_id)
+            sql += " AND detail_type_id IN ({})".format(",".join("?" * len(ids)))
+            params.extend(ids)
+        if source_item_id is not None:
+            sql += " AND source_item_id=?"
+            params.append(source_item_id)
+        if source is not None:
+            sql += " AND source=?"
+            params.append(source)
         sql += " ORDER BY id DESC"
         rows = self.conn.execute(sql, params).fetchall()
         paths = self.topic_paths([r["topic_id"] for r in rows if r["topic_id"]])
+        material_ids = {r["material_id"] for r in rows if r["material_id"]}
+        detail_ids = {r["detail_type_id"] for r in rows if r["detail_type_id"]}
+        material_titles = {}
+        if material_ids:
+            material_titles = {
+                row["id"]: row["title"] for row in self.conn.execute(
+                    "SELECT id, title FROM question_materials WHERE id IN ({})".format(
+                        ",".join("?" * len(material_ids))
+                    ),
+                    tuple(material_ids),
+                ).fetchall()
+            }
+        detail_names = {}
+        if detail_ids:
+            detail_names = {
+                row["id"]: row["name"] for row in self.conn.execute(
+                    "SELECT id, name FROM question_types WHERE id IN ({})".format(
+                        ",".join("?" * len(detail_ids))
+                    ),
+                    tuple(detail_ids),
+                ).fetchall()
+            }
         items = []
         for r in rows:
             d = dict(r)
             d["topic_path"] = paths.get(d["topic_id"], "（未分类）") if d["topic_id"] else "（未分类）"
+            d["material_title"] = material_titles.get(d["material_id"], "") if d["material_id"] else ""
+            d["detail_type_name"] = detail_names.get(d["detail_type_id"], "") if d["detail_type_id"] else ""
             items.append(d)
         return items
 
     def update_question(self, qid, **fields):
         allowed = {"topic_id", "question_text", "analysis", "result", "result_reason",
-                   "self_analysis", "correct_analysis", "reflection"}
+                   "self_analysis", "correct_analysis", "reflection",
+                   "material_id", "detail_type_id", "stem", "options", "answer"}
         sets, params = [], []
         for k, v in fields.items():
             if k in allowed:
@@ -1214,7 +1789,7 @@ class Database:
             return
         params.append(qid)
         self.conn.execute("UPDATE questions SET {} WHERE id=?".format(", ".join(sets)), params)
-        self.conn.commit()
+        self._commit()
 
     def delete_question(self, qid):
         rows = self.conn.execute(
@@ -1223,7 +1798,17 @@ class Database:
         rels = {r["file_path"] for r in rows if r["file_path"]}
         self.conn.execute("DELETE FROM question_images WHERE question_id=?", (qid,))
         self.conn.execute("DELETE FROM questions WHERE id=?", (qid,))
-        self.conn.commit()
+        self._commit()
+        self.delete_image_files(rels)
+
+    def clear_questions(self):
+        """清空全部题目及其图片，保留科目、材料等结构；编号从 Q0001 重新开始。"""
+        rows = self.conn.execute("SELECT file_path FROM question_images").fetchall()
+        rels = {r["file_path"] for r in rows if r["file_path"]}
+        self.conn.execute("DELETE FROM question_images")
+        self.conn.execute("DELETE FROM questions")
+        self.conn.execute("DELETE FROM settings WHERE key='question_seq'")
+        self._commit()
         self.delete_image_files(rels)
 
     def add_question_image(self, qid, rel_path, sort_order=0):
@@ -1231,7 +1816,7 @@ class Database:
             "INSERT INTO question_images(question_id, file_path, sort_order) VALUES (?,?,?)",
             (qid, rel_path, sort_order),
         )
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
     def get_question_images(self, qid):
@@ -1242,6 +1827,109 @@ class Database:
     def sync_question_images(self, qid, kept_rels, new_sources):
         """同步题目图片：新增 new_sources，保留 kept_rels，删除其余。"""
         return self._sync_images("question_images", "question_id", qid, kept_rels, new_sources)
+
+    # ---------- 题目材料 ----------
+    def list_question_materials(self, source_item_id=None, topic_id=None):
+        sql = "SELECT * FROM question_materials WHERE 1=1"
+        params = []
+        if source_item_id is not None:
+            sql += " AND source_item_id=?"
+            params.append(source_item_id)
+        if topic_id is not None:
+            ids = self.subtree_ids(topic_id)
+            sql += " AND topic_id IN ({})".format(",".join("?" * len(ids)))
+            params.extend(ids)
+        sql += " ORDER BY sort_order, id"
+        rows = [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+        for m in rows:
+            m["images"] = self.question_material_images(m["id"])
+            m["topic_path"] = self.topic_path(m["topic_id"]) if m["topic_id"] else "（未分类）"
+            m["detail_type_name"] = ""
+            if m.get("detail_type_id"):
+                node = self.get_question_type(m["detail_type_id"])
+                if node:
+                    m["detail_type_name"] = node.get("name") or ""
+        return rows
+
+    def get_question_material(self, material_id):
+        row = self.conn.execute(
+            "SELECT * FROM question_materials WHERE id=?", (material_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["images"] = self.question_material_images(material_id)
+        d["topic_path"] = self.topic_path(d["topic_id"]) if d["topic_id"] else "（未分类）"
+        return d
+
+    def add_question_material(self, source_item_id=None, topic_id=None, detail_type_id=None,
+                              kind="passage", title="", content="", sort_order=None):
+        if sort_order is None:
+            m = self.conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) AS m FROM question_materials "
+                "WHERE source_item_id IS ?",
+                (source_item_id,),
+            ).fetchone()["m"]
+            sort_order = m + 1
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = self.conn.execute(
+            "INSERT INTO question_materials(source_item_id, topic_id, detail_type_id, kind, title, "
+            "content, sort_order, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (source_item_id, topic_id, detail_type_id, kind or "passage",
+             (title or "").strip(), content or "", sort_order, now, now),
+        )
+        self._commit()
+        return cur.lastrowid
+
+    def update_question_material(self, material_id, **fields):
+        allowed = {"source_item_id", "topic_id", "detail_type_id", "kind", "title",
+                   "content", "sort_order"}
+        sets, params = [], []
+        for k, v in fields.items():
+            if k in allowed:
+                sets.append("{} = ?".format(k))
+                params.append(v)
+        if not sets:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        params.extend([now, material_id])
+        self.conn.execute(
+            "UPDATE question_materials SET {}, updated_at=? WHERE id=?".format(", ".join(sets)),
+            params,
+        )
+        self._commit()
+
+    def delete_question_material(self, material_id):
+        rows = self.conn.execute(
+            "SELECT file_path FROM question_material_images WHERE material_id=?", (material_id,)
+        ).fetchall()
+        rels = {r["file_path"] for r in rows if r["file_path"]}
+        self.conn.execute("DELETE FROM question_material_images WHERE material_id=?", (material_id,))
+        self.conn.execute(
+            "UPDATE questions SET material_id=NULL WHERE material_id=?", (material_id,))
+        self.conn.execute("DELETE FROM question_materials WHERE id=?", (material_id,))
+        self._commit()
+        self.delete_image_files(rels)
+
+    def question_material_images(self, material_id):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM question_material_images WHERE material_id=? ORDER BY sort_order, id",
+            (material_id,),
+        )]
+
+    def add_question_material_image(self, material_id, rel_path, sort_order=0):
+        cur = self.conn.execute(
+            "INSERT INTO question_material_images(material_id, file_path, sort_order) "
+            "VALUES (?,?,?)",
+            (material_id, rel_path, sort_order),
+        )
+        self._commit()
+        return cur.lastrowid
+
+    def sync_question_material_images(self, material_id, kept_rels, new_sources):
+        """同步材料图片：新增 new_sources，保留 kept_rels，删除其余。"""
+        return self._sync_images(
+            "question_material_images", "material_id", material_id, kept_rels, new_sources)
 
     def wrong_questions(self, start_date, end_date):
         return self.list_questions(result="wrong", start_date=start_date, end_date=end_date)
@@ -1326,7 +2014,7 @@ class Database:
             "updated_at=excluded.updated_at",
             (week_start, review_text or "", next_focus or "", now, now),
         )
-        self.conn.commit()
+        self._commit()
 
     # ---------- 总体进度指标 ----------
     def list_metrics(self):
@@ -1373,7 +2061,7 @@ class Database:
 
     def set_metric_enabled(self, mid, enabled):
         self.conn.execute("UPDATE progress_metrics SET enabled=? WHERE id=?", (1 if enabled else 0, mid))
-        self.conn.commit()
+        self._commit()
 
     def add_custom_metric(self, name, unit="", target=None):
         name = name.strip()
@@ -1387,7 +2075,7 @@ class Database:
             "VALUES (?, 'custom', 1, 0, ?, ?, ?)",
             (name, target, unit or "", max_order + 1),
         )
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
     def delete_metric(self, mid):
@@ -1395,17 +2083,17 @@ class Database:
         if not row or row["kind"] != "custom":
             return
         self.conn.execute("DELETE FROM progress_metrics WHERE id=?", (mid,))
-        self.conn.commit()
+        self._commit()
 
     def set_metric_value(self, mid, value):
         self.conn.execute("UPDATE progress_metrics SET value=? WHERE id=?", (float(value), mid))
-        self.conn.commit()
+        self._commit()
 
     def set_metric_target(self, mid, target):
         self.conn.execute(
             "UPDATE progress_metrics SET target=? WHERE id=?", (float(target) if target not in (None, "") else None, mid)
         )
-        self.conn.commit()
+        self._commit()
 
 
 
@@ -1438,14 +2126,34 @@ class Database:
             "VALUES (NULL, ?, ?, 'subject', ?, 0, ?, ?)",
             (map_id, subject_name, color, now, now),
         )
-        self.conn.commit()
+        self._commit()
         return map_id
 
     def delete_question_map(self, map_id):
+        # 删除前先把题目/材料的细分题型关联置空，避免残留孤立引用
+        rows = self.conn.execute(
+            "SELECT id FROM question_types WHERE map_id=?", (map_id,)
+        ).fetchall()
+        qtype_ids = []
+        for r in rows:
+            for qid in self._question_type_subtree_ids(r["id"]):
+                if qid not in qtype_ids:
+                    qtype_ids.append(qid)
+        if qtype_ids:
+            qp = ",".join("?" * len(qtype_ids))
+            self.conn.execute(
+                "UPDATE questions SET detail_type_id=NULL WHERE detail_type_id IN ({})".format(qp),
+                qtype_ids,
+            )
+            self.conn.execute(
+                "UPDATE question_materials SET detail_type_id=NULL "
+                "WHERE detail_type_id IN ({})".format(qp),
+                qtype_ids,
+            )
         # 删除该导图下所有节点，再删除导图
         self.conn.execute("DELETE FROM question_types WHERE map_id=?", (map_id,))
         self.conn.execute("DELETE FROM question_maps WHERE id=?", (map_id,))
-        self.conn.commit()
+        self._commit()
 
     def update_question_map(self, map_id, **fields):
         allowed = {"subject_name", "color", "layout_mode", "layout_type",
@@ -1464,7 +2172,7 @@ class Database:
             "UPDATE question_maps SET {}, updated_at=? WHERE id=?".format(", ".join(sets)),
             params,
         )
-        self.conn.commit()
+        self._commit()
 
     def question_types_by_map(self, map_id):
         return [dict(r) for r in self.conn.execute(
@@ -1477,11 +2185,45 @@ class Database:
         rows = self.conn.execute(
             "SELECT q.topic_id AS tid, COUNT(*) AS total, "
             "SUM(CASE WHEN q.result='wrong' THEN 1 ELSE 0 END) AS wrong "
-            "FROM questions q JOIN question_types n ON n.topic_id = q.topic_id "
-            "WHERE n.map_id=? GROUP BY q.topic_id",
+            "FROM questions q "
+            "WHERE EXISTS (SELECT 1 FROM question_types n "
+            "              WHERE n.map_id=? AND n.topic_id = q.topic_id) "
+            "GROUP BY q.topic_id",
             (map_id,),
         ).fetchall()
         return {r["tid"]: (int(r["total"]), int(r["wrong"] or 0)) for r in rows}
+
+    def question_subtree_stats_by_map(self, map_id):
+        """节点级题目统计：{node_id: (total, wrong)}，父节点汇总整棵子树（同知识点去重）。"""
+        nodes = self.question_types_by_map(map_id)
+        direct = self.question_stats_by_map(map_id)
+        children = {}
+        for n in nodes:
+            children.setdefault(n["parent_id"], []).append(n)
+        result = {}
+
+        def visit_node(node):
+            tid = node.get("topic_id")
+            tids = set()
+            total = 0
+            wrong = 0
+            if tid and tid in direct:
+                total, wrong = direct[tid]
+                tids.add(tid)
+            for child in children.get(node["id"], []):
+                c_tids, c_total, c_wrong = visit_node(child)
+                fresh = c_tids - tids
+                for t in fresh:
+                    t2, w2 = direct.get(t, (0, 0))
+                    total += t2
+                    wrong += w2
+                tids.update(fresh)
+            result[node["id"]] = (total, wrong)
+            return tids, total, wrong
+
+        for root_node in children.get(None, []):
+            visit_node(root_node)
+        return result
 
     def list_question_types(self):
         return [dict(r) for r in self.conn.execute(
@@ -1524,7 +2266,7 @@ class Database:
             "UPDATE question_types SET collapsed=?, updated_at=? WHERE map_id=?",
             (1 if collapsed else 0, now, map_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def add_question_type(self, name, parent_id=None, node_type="type",
                           recognition="", approach="", method=""):
@@ -1546,9 +2288,33 @@ class Database:
             (parent_id, name, node_type, recognition or "", approach or "", method or "",
              max_order + 1, now, now),
         )
-        self.conn.commit()
+        self._commit()
         return cur.lastrowid
 
+
+    def _insert_question_type_row(self, name, parent_id, map_id, node_type="type",
+                                  recognition="", approach="", method="", remark="",
+                                  color="", node_width=0, auto_width=1, pos_x=0, pos_y=0,
+                                  collapsed=0, topic_id=None, sort_order=None):
+        """不提交事务地插入题型节点，供需要整体事务的联动方法复用。"""
+        if sort_order is None:
+            max_order = self.conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) AS m FROM question_types "
+                "WHERE parent_id IS ?",
+                (parent_id,),
+            ).fetchone()["m"]
+            sort_order = max_order + 1
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = self.conn.execute(
+            "INSERT INTO question_types(parent_id, map_id, name, node_type, recognition, approach, method, "
+            "remark, color, node_width, auto_width, pos_x, pos_y, collapsed, topic_id, sort_order, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (parent_id, map_id, name, node_type, recognition or "", approach or "", method or "",
+             remark or "", color or "", float(node_width or 0), 1 if auto_width else 0,
+             float(pos_x or 0), float(pos_y or 0), 1 if collapsed else 0, topic_id,
+             sort_order, now, now),
+        )
+        return cur.lastrowid
 
     def add_question_type_full(self, name, parent_id=None, node_type="type", map_id=None,
                                recognition="", approach="", method="", remark="",
@@ -1563,21 +2329,44 @@ class Database:
             map_id = self.get_question_type(parent_id)["map_id"]
         if map_id is None:
             raise ValueError("缺少 map_id，无法确定所属思维导图")
-        max_order = self.conn.execute(
-            "SELECT COALESCE(MAX(sort_order), -1) AS m FROM question_types WHERE parent_id IS ?",
-            (parent_id,),
-        ).fetchone()["m"]
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cur = self.conn.execute(
-            "INSERT INTO question_types(parent_id, map_id, name, node_type, recognition, approach, method, "
-            "remark, color, node_width, auto_width, pos_x, pos_y, collapsed, topic_id, sort_order, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (parent_id, map_id, name, node_type, recognition or "", approach or "", method or "",
-             remark or "", color or "", float(node_width or 0), 1 if auto_width else 0, float(pos_x or 0),
-             float(pos_y or 0), 1 if collapsed else 0, topic_id, max_order + 1, now, now),
+        qtype_id = self._insert_question_type_row(
+            name, parent_id, map_id, node_type=node_type, recognition=recognition,
+            approach=approach, method=method, remark=remark, color=color,
+            node_width=node_width, auto_width=auto_width, pos_x=pos_x, pos_y=pos_y,
+            collapsed=collapsed, topic_id=topic_id,
         )
-        self.conn.commit()
-        return cur.lastrowid
+        self._commit()
+        return qtype_id
+
+    def add_synced_question_type(self, name, parent_id=None, map_id=None, **fields):
+        """单事务新增导图节点并同步创建科目「具体分类」与知识库文档。
+
+        返回 (question_type_id, topic_id)，任一环节失败都不留下半成品。
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("名称不能为空")
+        self._validate_question_type_parent(parent_id, map_id=map_id)
+        if parent_id is not None and map_id is None:
+            map_id = self.get_question_type(parent_id)["map_id"]
+        if map_id is None:
+            raise ValueError("缺少 map_id，无法确定所属思维导图")
+        parent_topic_id = self.parent_topic_for_question_type(parent_id, map_id)
+        if parent_topic_id is None:
+            raise ValueError("当前思维导图未关联科目管理，无法同步新增")
+        with self.transaction():
+            topic_id = self._insert_topic_row(name, parent_topic_id, "category")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.conn.execute(
+                "INSERT INTO knowledge_docs(title, topic_id, source, source_item_id, "
+                "source_image, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                (name, topic_id, "manual", None, "", now, now),
+            )
+            node_type = fields.pop("node_type", "type")
+            qtype_id = self._insert_question_type_row(
+                name, parent_id, map_id, node_type=node_type, topic_id=topic_id, **fields,
+            )
+        return qtype_id, topic_id
 
     def update_question_type_full(self, qtype_id, **fields):
         allowed = {"name", "parent_id", "node_type", "recognition", "approach", "method",
@@ -1606,7 +2395,7 @@ class Database:
             "UPDATE question_types SET {}, updated_at=? WHERE id=?".format(", ".join(sets)),
             params,
         )
-        self.conn.commit()
+        self._commit()
 
     def toggle_question_type_collapsed(self, qtype_id, collapsed=None):
         node = self.get_question_type(qtype_id)
@@ -1614,7 +2403,7 @@ class Database:
             return
         val = int(collapsed) if collapsed is not None else (0 if node.get("collapsed") else 1)
         self.conn.execute("UPDATE question_types SET collapsed=? WHERE id=?", (val, qtype_id))
-        self.conn.commit()
+        self._commit()
 
     def update_question_type(self, qtype_id, **fields):
         allowed = {"name", "parent_id", "node_type", "recognition", "approach", "method"}
@@ -1632,11 +2421,36 @@ class Database:
             "UPDATE question_types SET {}, updated_at=? WHERE id=?".format(", ".join(sets)),
             params,
         )
-        self.conn.commit()
+        self._commit()
 
     def delete_question_type(self, qtype_id):
+        self.conn.execute("DELETE FROM knowledge_links WHERE question_type_id=?", (qtype_id,))
         self.conn.execute("DELETE FROM question_types WHERE id=?", (qtype_id,))
-        self.conn.commit()
+        self._commit()
+
+    def delete_question_type_with_sync(self, qtype_id):
+        """删除导图节点并联动清理：关联科目走整支删除，未关联节点清子树引用。"""
+        node = self.get_question_type(qtype_id)
+        if not node:
+            return
+        if node.get("topic_id"):
+            self.delete_topic_cascade(node["topic_id"])
+            return
+        ids = self._question_type_subtree_ids(qtype_id)
+        ph = ",".join("?" * len(ids))
+        self.conn.execute(
+            "UPDATE questions SET detail_type_id=NULL WHERE detail_type_id IN ({})".format(ph), ids
+        )
+        self.conn.execute(
+            "UPDATE question_materials SET detail_type_id=NULL "
+            "WHERE detail_type_id IN ({})".format(ph),
+            ids,
+        )
+        self.conn.execute(
+            "DELETE FROM knowledge_links WHERE question_type_id IN ({})".format(ph), ids
+        )
+        self.conn.execute("DELETE FROM question_types WHERE id IN ({})".format(ph), ids)
+        self._commit()
 
     def move_question_type(self, qtype_id, new_parent_id, index=None):
         """移动题型节点：改父层级 + 同级位置（index=None 追加到末尾）。
@@ -1682,7 +2496,7 @@ class Database:
             "UPDATE question_types SET parent_id=?, sort_order=?, updated_at=? WHERE id=?",
             (new_parent_id, pos, now, qtype_id),
         )
-        self.conn.commit()
+        self._commit()
         return self.conn.total_changes
 
     def question_type_children(self, parent_id=None):
@@ -1690,6 +2504,324 @@ class Database:
             "SELECT * FROM question_types WHERE parent_id IS ? ORDER BY sort_order, id",
             (parent_id,),
         )]
+
+    def question_type_path(self, qtype_id):
+        """返回导图节点从根到自身的完整路径（如 资料分析 / 单一指标）。"""
+        if qtype_id is None:
+            return ""
+        names = []
+        cur_id = qtype_id
+        seen = set()
+        while cur_id and cur_id not in seen:
+            seen.add(cur_id)
+            node = self.get_question_type(cur_id)
+            if not node:
+                break
+            names.append(node.get("name") or "")
+            cur_id = node.get("parent_id")
+        return " / ".join(reversed(names))
+
+    def detail_type_paths_for_topic(self, topic_id):
+        """返回科目子树在思维导图中的「细分分类」路径：[(path, question_type_id), ...]。"""
+        if not topic_id:
+            return []
+        ids = self.subtree_ids(topic_id)
+        if not ids:
+            return []
+        ph = ",".join("?" * len(ids))
+        nodes = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM question_types WHERE topic_id IN ({})".format(ph), ids
+        ).fetchall()]
+        map_ids = {n["map_id"] for n in nodes if n.get("map_id")}
+        by_id = {n["id"]: n for n in nodes}
+        for map_id in map_ids:
+            for n in self.question_types_by_map(map_id):
+                by_id.setdefault(n["id"], n)
+        # 优先只取「具体分类」叶子（type 节点）；没有 type 节点时退回全部已关联科目节点。
+        candidates = [
+            n for n in by_id.values()
+            if n.get("topic_id") in ids and n.get("node_type") == "type"
+        ]
+        if not candidates:
+            candidates = [
+                n for n in by_id.values()
+                if n.get("topic_id") in ids
+            ]
+        seen = set()
+        out = []
+        for n in sorted(candidates, key=lambda x: (x.get("sort_order") or 0, x["id"])):
+            if n["id"] in seen:
+                continue
+            seen.add(n["id"])
+            path = self.question_type_path(n["id"])
+            out.append((path, n["id"]))
+        return sorted(out, key=lambda x: (x[0], x[1]))
+
+    # ---------- 知识库 ----------
+    def list_knowledge_docs(self, topic_id=None, keyword=""):
+        sql = (
+            "SELECT d.*, "
+            "(SELECT COUNT(*) FROM knowledge_blocks b WHERE b.doc_id=d.id) AS block_count, "
+            "(SELECT COUNT(*) FROM knowledge_images ki WHERE ki.doc_id=d.id) AS image_count "
+            "FROM knowledge_docs d"
+        )
+        conds, args = [], []
+        if topic_id is not None:
+            conds.append("d.topic_id=?")
+            args.append(topic_id)
+        if keyword:
+            conds.append("(d.title LIKE ? OR d.id IN (SELECT doc_id FROM knowledge_blocks "
+                         "WHERE title LIKE ? OR content LIKE ?))")
+            args.extend(["%{}%".format(keyword)] * 3)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY d.updated_at DESC, d.id DESC"
+        return [dict(r) for r in self.conn.execute(sql, args)]
+
+    def get_knowledge_doc(self, doc_id):
+        row = self.conn.execute("SELECT * FROM knowledge_docs WHERE id=?", (doc_id,)).fetchone()
+        return dict(row) if row else None
+
+    def add_knowledge_doc(self, title="", topic_id=None, source="manual",
+                          source_item_id=None, source_image=""):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = self.conn.execute(
+            "INSERT INTO knowledge_docs(title, topic_id, source, source_item_id, source_image, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (title or "未命名知识点", topic_id, source or "manual", source_item_id,
+             source_image or "", now, now),
+        )
+        self._commit()
+        return cur.lastrowid
+
+    def update_knowledge_doc(self, doc_id, title=None, topic_id=_UNSET,
+                             source_image=_UNSET):
+        sets, params = [], []
+        if title is not None:
+            sets.append("title=?")
+            params.append((title or "未命名知识点").strip())
+        if topic_id is not _UNSET:
+            sets.append("topic_id=?")
+            params.append(topic_id)
+        if source_image is not _UNSET:
+            sets.append("source_image=?")
+            params.append(source_image or "")
+        if not sets:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sets.append("updated_at=?")
+        params.extend([now, doc_id])
+        self.conn.execute(
+            "UPDATE knowledge_docs SET {} WHERE id=?".format(", ".join(sets)), params
+        )
+        self._commit()
+
+    def delete_knowledge_doc(self, doc_id):
+        rels = [r["file_path"] for r in self.conn.execute(
+            "SELECT file_path FROM knowledge_images WHERE doc_id=?", (doc_id,)
+        ).fetchall()]
+        rels.extend(self._knowledge_content_refs(doc_id))
+        rels = list(dict.fromkeys(rels))
+        self.conn.execute("DELETE FROM knowledge_docs WHERE id=?", (doc_id,))
+        self._commit()
+        self.delete_image_files([rel for rel in rels if not self.is_image_used(rel)])
+
+    def _knowledge_content_refs(self, doc_id):
+        """返回某文档全部知识块正文里引用的图片相对路径。"""
+        refs = []
+        for row in self.conn.execute(
+            "SELECT content FROM knowledge_blocks WHERE doc_id=?", (doc_id,)
+        ):
+            refs.extend(extract_content_image_paths(row["content"] or ""))
+        return list(dict.fromkeys(refs))
+
+    def is_image_used(self, rel):
+        """判断相对路径图片是否仍被知识块正文或文档图片记录引用。"""
+        if not rel:
+            return False
+        like = "%{}%".format(rel.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        for row in self.conn.execute(
+            "SELECT 1 FROM knowledge_blocks WHERE content LIKE ? ESCAPE '\\' LIMIT 1", (like,)
+        ):
+            return True
+        for row in self.conn.execute(
+            "SELECT 1 FROM knowledge_images WHERE file_path=? LIMIT 1", (rel,)
+        ):
+            return True
+        return False
+
+    def knowledge_images(self, doc_id):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM knowledge_images WHERE doc_id=? ORDER BY sort_order, id", (doc_id,)
+        )]
+
+    def add_knowledge_image(self, doc_id, rel_path, sort_order=0):
+        cur = self.conn.execute(
+            "INSERT INTO knowledge_images(doc_id, file_path, sort_order) VALUES (?,?,?)",
+            (doc_id, rel_path, sort_order),
+        )
+        self._commit()
+        return cur.lastrowid
+
+    def sync_knowledge_images(self, doc_id, new_sources):
+        """把新图片复制入库并挂到知识文档（保留已有图片）。返回最新图片列表。"""
+        for src in new_sources:
+            rel = self.store_image_from_path(src)
+            max_order = self.conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) AS m FROM knowledge_images WHERE doc_id=?",
+                (doc_id,),
+            ).fetchone()["m"]
+            self.add_knowledge_image(doc_id, rel, max_order + 1)
+        return self.knowledge_images(doc_id)
+
+    def list_knowledge_blocks(self, doc_id):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM knowledge_blocks WHERE doc_id=? ORDER BY sort_order, id", (doc_id,)
+        )]
+
+    def get_knowledge_block(self, block_id):
+        row = self.conn.execute("SELECT * FROM knowledge_blocks WHERE id=?", (block_id,)).fetchone()
+        return dict(row) if row else None
+
+    def add_knowledge_block(self, doc_id, title, content, sort_order=None):
+        if sort_order is None:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) AS m FROM knowledge_blocks WHERE doc_id=?",
+                (doc_id,),
+            ).fetchone()
+            sort_order = row["m"] + 1
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = self.conn.execute(
+            "INSERT INTO knowledge_blocks(doc_id, title, content, sort_order, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (doc_id, (title or "未命名知识点").strip(), content or "", sort_order, now, now),
+        )
+        self._commit()
+        return cur.lastrowid
+
+    def update_knowledge_block(self, block_id, title=None, content=None):
+        old_content = None
+        if content is not None:
+            row = self.conn.execute(
+                "SELECT content FROM knowledge_blocks WHERE id=?", (block_id,)
+            ).fetchone()
+            old_content = row["content"] if row else None
+        sets, params = [], []
+        if title is not None:
+            sets.append("title=?")
+            params.append((title or "未命名知识点").strip())
+        if content is not None:
+            sets.append("content=?")
+            params.append(content or "")
+        if not sets:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sets.append("updated_at=?")
+        params.extend([now, block_id])
+        self.conn.execute(
+            "UPDATE knowledge_blocks SET {} WHERE id=?".format(", ".join(sets)), params
+        )
+        self.conn.execute(
+            "UPDATE knowledge_docs SET updated_at=? WHERE id=("
+            "SELECT doc_id FROM knowledge_blocks WHERE id=?)",
+            (now, block_id),
+        )
+        self._commit()
+        if old_content is not None:
+            old_refs = extract_content_image_paths(old_content or "")
+            self.delete_image_files(
+                [rel for rel in old_refs if not self.is_image_used(rel)])
+
+    def delete_knowledge_block(self, block_id):
+        rels = []
+        row = self.conn.execute(
+            "SELECT content FROM knowledge_blocks WHERE id=?", (block_id,)
+        ).fetchone()
+        if row:
+            rels = extract_content_image_paths(row["content"] or "")
+        self.conn.execute("DELETE FROM knowledge_blocks WHERE id=?", (block_id,))
+        self._commit()
+        self.delete_image_files([rel for rel in rels if not self.is_image_used(rel)])
+
+    def knowledge_links_for_block(self, block_id):
+        """返回某知识块关联的导图节点列表（含导图与科目名）。"""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT kl.*, qt.name AS node_name, qm.subject_name, qm.id AS map_id "
+            "FROM knowledge_links kl "
+            "JOIN question_types qt ON qt.id = kl.question_type_id "
+            "LEFT JOIN question_maps qm ON qm.id = qt.map_id "
+            "WHERE kl.block_id=? ORDER BY kl.id",
+            (block_id,),
+        )]
+
+    def knowledge_links_for_node(self, node_id):
+        """返回某导图节点关联的知识块列表（含文档标题）。"""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT kl.*, kb.title AS block_title, kb.content AS block_content, "
+            "kd.title AS doc_title, kd.id AS doc_id "
+            "FROM knowledge_links kl "
+            "JOIN knowledge_blocks kb ON kb.id = kl.block_id "
+            "JOIN knowledge_docs kd ON kd.id = kb.doc_id "
+            "WHERE kl.question_type_id=? ORDER BY kd.updated_at DESC, kb.id",
+            (node_id,),
+        )]
+
+    def link_knowledge_block(self, block_id, question_type_id, auto_link=False):
+        """建立知识块与导图节点关联；已关联时不重复插入。返回 link id 或 None。"""
+        block = self.get_knowledge_block(block_id)
+        node = self.get_question_type(question_type_id)
+        if not block or not node:
+            raise ValueError("知识块或导图节点不存在")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = self.conn.execute(
+            "INSERT INTO knowledge_links(block_id, question_type_id, auto_link, created_at) "
+            "VALUES (?,?,?,?) "
+            "ON CONFLICT(block_id, question_type_id) DO NOTHING",
+            (block_id, question_type_id, 1 if auto_link else 0, now),
+        )
+        self._commit()
+        return cur.lastrowid if cur.rowcount else None
+
+    def unlink_knowledge_block(self, block_id, question_type_id):
+        self.conn.execute(
+            "DELETE FROM knowledge_links WHERE block_id=? AND question_type_id=?",
+            (block_id, question_type_id),
+        )
+        self._commit()
+
+    def unlink_knowledge_block_all(self, block_id):
+        self.conn.execute("DELETE FROM knowledge_links WHERE block_id=?", (block_id,))
+        self._commit()
+
+    def auto_link_knowledge(self, doc_id):
+        """按文档绑定科目自动关联知识块到该科目导图内同 topic 的节点。
+
+        返回本次新增的关联数。已有关联不重复创建。
+        """
+        doc = self.get_knowledge_doc(doc_id)
+        if not doc or not doc.get("topic_id"):
+            return 0
+        topic = self.conn.execute(
+            "SELECT id FROM topics WHERE id=? AND kind='category'", (doc["topic_id"],)
+        ).fetchone()
+        if not topic:
+            return 0
+        ids = self.subtree_ids(doc["topic_id"])
+        ph = ",".join("?" * len(ids))
+        nodes = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM question_types WHERE topic_id IN ({})".format(ph), ids
+        ).fetchall()]
+        blocks = [r["id"] for r in self.conn.execute(
+            "SELECT id FROM knowledge_blocks WHERE doc_id=?", (doc_id,)
+        ).fetchall()]
+        with self.transaction():
+            added = 0
+            for bid in blocks:
+                for nid in nodes:
+                    if self.link_knowledge_block(bid, nid, auto_link=True) is not None:
+                        added += 1
+            return added
+
 
 def validate_date(value):
     value = str(value).strip()
